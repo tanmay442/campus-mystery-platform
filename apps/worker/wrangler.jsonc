@@ -1,0 +1,76 @@
+{
+  "name": "campus-mystery-platform",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "vars": {
+    "ENVIRONMENT": "development",
+    // ADMIN_EMAILS stays empty here on purpose. The production value is set
+    // via the Cloudflare dashboard / secrets, never committed to the repo.
+    "ADMIN_EMAILS": ""
+  },
+  // database_id below is a local-only placeholder so `wrangler dev` and
+  // `--local` migrations run without Cloudflare credentials. Real IDs are
+  // written here when staging/production are provisioned (Phase 0) via
+  // `wrangler d1 create`. Never invent IDs for remote use.
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "campus-mystery-dev",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "../../packages/db/migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "MEDIA",
+      "bucket_name": "campus-mystery-media-dev"
+    }
+  ],
+  "env": {
+    "staging": {
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "ADMIN_EMAILS": ""
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "campus-mystery-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "../../packages/db/migrations"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "MEDIA",
+          "bucket_name": "campus-mystery-media-staging"
+        }
+      ]
+    },
+    "production": {
+      "vars": {
+        "ENVIRONMENT": "production",
+        "ADMIN_EMAILS": ""
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "campus-mystery-production",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "../../packages/db/migrations"
+        }
+      ],
+      "r2_buckets": [
+        {
+          "binding": "MEDIA",
+          "bucket_name": "campus-mystery-media-production"
+        }
+      ]
+    }
+  }
+}

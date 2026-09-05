@@ -1,16 +1,20 @@
-name: campus-mystery-platform
-version: 0.1.0
-private: true
-description: Mobile-first reusable gamified event platform. Phase 1 production foundation.
-packageManager: pnpm@10.15.1
-engines:
-  node: ">=20"
-type: module
-scripts:
-  dev: pnpm --parallel --filter './apps/*' dev
-  build: pnpm --recursive build
-  typecheck: pnpm --recursive typecheck
-  lint: pnpm --recursive lint
-  test: pnpm --recursive test
-  db:generate: pnpm --filter @campus/db generate
-  db:apply:local: pnpm --filter @campus/worker db:apply:local
+{
+  "name": "campus-mystery-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mobile-first reusable gamified event platform. Phase 1 production foundation.",
+  "packageManager": "pnpm@10.15.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "type": "module",
+  "scripts": {
+    "dev": "pnpm --parallel --filter './apps/*' dev",
+    "build": "pnpm --recursive build",
+    "typecheck": "pnpm --recursive typecheck",
+    "lint": "pnpm --recursive lint",
+    "test": "pnpm --recursive test",
+    "db:generate": "pnpm --filter @campus/db generate",
+    "db:apply:local": "pnpm --filter @campus/worker db:apply:local"
+  }
+}
