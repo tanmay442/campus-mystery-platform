@@ -1,27 +1,77 @@
+/** Session-cookie authentication: validates cmp_session and attaches the user. */
+import { getCookie } from "hono/cookie";
 import { createMiddleware } from "hono/factory";
+import { z } from "zod";
 import type { AppEnv } from "../env";
+import { sha256Hex } from "../lib/crypto";
+import { errorResponse } from "../lib/errors";
+import { nowIso } from "../lib/time";
 
-function parseSessionCookie(header: string | undefined): string | undefined {
-  if (header === undefined || header.length === 0) {
-    return undefined;
-  }
-  const parts = header.split(";");
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (trimmed.startsWith("session=")) {
-      const value = trimmed.slice("session=".length).trim();
-      if (value.length > 0) {
-        return value;
-      }
-    }
-  }
-  return undefined;
-}
+const SESSION_COOKIE = "cmp_session";
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+const PUBLIC_ROUTES = new Set([
+  "GET /api/health",
+  "POST /api/auth/login",
+  "POST /api/auth/logout",
+  "GET /api/auth/username-availability",
+]);
+
+const SESSION_LOOKUP_SQL = [
+  "SELECT s.id AS session_id, s.revoked_at AS revoked_at,",
+  "s.expires_at AS expires_at, u.id AS user_id, u.email AS user_email,",
+  "u.email_verified AS user_email_verified, u.username AS user_username",
+  "FROM sessions s INNER JOIN users u ON s.user_id = u.id",
+  "WHERE s.token_hash = ?",
+].join(" ");
+
+const SLIDING_REFRESH_SQL =
+  "UPDATE sessions SET last_seen_at = ?, expires_at = ? WHERE id = ?";
+
+const sessionRowSchema = z.object({
+  session_id: z.string().min(1),
+  revoked_at: z.string().nullable(),
+  expires_at: z.string().min(1),
+  user_id: z.string().min(1),
+  user_email: z.string().email(),
+  user_email_verified: z.number().int(),
+  user_username: z.string().min(1),
+});
 
 export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
-  const token = parseSessionCookie(c.req.header("Cookie"));
-  if (token !== undefined) {
-    c.set("sessionToken", token);
+  const token = getCookie(c, SESSION_COOKIE);
+  if (token === undefined || token.length === 0) {
+    await next();
+    return;
   }
+  const tokenHash = await sha256Hex(token);
+  const raw: unknown = await c.env.DB.prepare(SESSION_LOOKUP_SQL)
+    .bind(tokenHash)
+    .first();
+  const parsed = sessionRowSchema.safeParse(raw);
+  const now = nowIso();
+  if (
+    parsed.success === false ||
+    parsed.data.revoked_at !== null ||
+    parsed.data.expires_at <= now
+  ) {
+    if (PUBLIC_ROUTES.has(`${c.req.method} ${c.req.path}`)) {
+      await next();
+      return;
+    }
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
+  const row = parsed.data;
+  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+  await c.env.DB.prepare(SLIDING_REFRESH_SQL)
+    .bind(now, expiresAt, row.session_id)
+    .run();
+  c.set("user", {
+    id: row.user_id,
+    email: row.user_email,
+    emailVerified: row.user_email_verified === 1,
+  });
+  c.set("sessionToken", token);
   await next();
 });

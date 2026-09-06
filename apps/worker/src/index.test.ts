@@ -63,17 +63,17 @@ describe("GET /api/health", () => {
     }
   });
 
-  it("returns 501 for stubbed routes after validation", async () => {
+  it("returns EVENT_NOT_FOUND for an unknown event id", async () => {
     const res = await app.request(
       "/api/events/demo-event",
       {},
       testEnv()
     );
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(404);
     const parsed = envelopeSchema.safeParse(await res.json());
     expect(parsed.success).toBe(true);
     if (parsed.success) {
-      expect(parsed.data.code).toBe("INTERNAL");
+      expect(parsed.data.code).toBe("EVENT_NOT_FOUND");
     }
   });
 });

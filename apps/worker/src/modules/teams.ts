@@ -1,7 +1,28 @@
+/** Team creation, shareable invites, join requests, and atomic approvals. */
+
+import {
+  DEFAULT_INVITE_EXPIRY_SECONDS,
+  JOIN_LEAVE_COOLDOWN_SECONDS,
+  LATE_JOIN_PENALTY_SECONDS,
+  MAX_MEMBERSHIP_CHANGES_PER_WINDOW,
+  MAX_TEAM_SIZE,
+  TEAM_APPROVAL_WINDOW_SECONDS,
+  canManageMembers,
+  createInviteSchema,
+  createTeamSchema
+} from "@campus/shared";
 import { Hono } from "hono";
+import { getCookie } from "hono/cookie";
 import { z } from "zod";
-import type { AppEnv } from "../env";
-import { errorResponse, notImplemented } from "../lib/errors";
+import type {
+  AppEnv,
+  DatabaseBinding,
+  PreparedStatementBinding
+} from "../env";
+import type { AppContext } from "../lib/errors";
+import { newId, sha256Hex } from "../lib/crypto";
+import { errorResponse } from "../lib/errors";
+import { nowIso } from "../lib/time";
 
 const eventIdParams = z.object({ eventId: z.string().min(1) });
 
@@ -13,17 +34,530 @@ const inviteTokenParams = z.object({ token: z.string().min(1) });
 
 const requestIdParams = z.object({ requestId: z.string().min(1) });
 
-const createTeamBody = z
+const sessionRowSchema = z.object({
+  id: z.string(),
+  user_id: z.string(),
+  expires_at: z.string(),
+  revoked_at: z.string().nullable()
+});
+
+const userRowSchema = z.object({
+  id: z.string(),
+  username: z.string(),
+  email_verified: z.number()
+});
+
+const eventRowSchema = z.object({
+  id: z.string(),
+  status: z.string()
+});
+
+const participantRowSchema = z.object({
+  id: z.string(),
+  event_id: z.string(),
+  type: z.string(),
+  name: z.string(),
+  event_points: z.number(),
+  penalty_seconds: z.number()
+});
+
+const memberRowSchema = z.object({
+  id: z.string(),
+  participant_id: z.string(),
+  user_id: z.string(),
+  role: z.string(),
+  joined_at: z.string(),
+  left_at: z.string().nullable()
+});
+
+const memberWithUsernameSchema = memberRowSchema.extend({
+  username: z.string()
+});
+
+const inviteRowSchema = z.object({
+  id: z.string(),
+  participant_id: z.string(),
+  invited_by: z.string(),
+  token_hash: z.string().nullable(),
+  requested_user_id: z.string().nullable(),
+  status: z.string(),
+  expires_at: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string()
+});
+
+const historyRowSchema = z.object({
+  joined_at: z.string(),
+  left_at: z.string().nullable()
+});
+
+const countRowSchema = z.object({
+  count: z.number()
+});
+
+const completionRowSchema = z.object({
+  completed_at: z.string()
+});
+
+const runResultSchema = z
   .object({
-    name: z.string().min(1).max(64)
+    success: z.boolean().optional(),
+    meta: z.object({ changes: z.number().optional() }).optional()
   })
   .catchall(z.unknown());
 
-const createInviteBody = z
-  .object({
-    expiresAt: z.string().datetime().optional()
-  })
-  .catchall(z.unknown());
+export interface VerifiedUser {
+  id: string;
+  username: string;
+}
+
+export type AuthResult =
+  | { ok: true; user: VerifiedUser }
+  | { ok: false; response: Response };
+
+export interface StoredUser {
+  id: string;
+  username: string;
+  emailVerified: number;
+}
+
+export interface StoredEvent {
+  id: string;
+  status: string;
+}
+
+export interface StoredParticipant {
+  id: string;
+  eventId: string;
+  kind: string;
+  name: string;
+  eventPoints: number;
+  penaltySeconds: number;
+}
+
+export interface StoredMember {
+  id: string;
+  participantId: string;
+  userId: string;
+  role: string;
+  joinedAt: string;
+  leftAt: string | null;
+}
+
+export interface StoredMemberWithUsername extends StoredMember {
+  username: string;
+}
+
+export interface StoredInvite {
+  id: string;
+  participantId: string;
+  invitedBy: string;
+  tokenHash: string | null;
+  requestedUserId: string | null;
+  status: string;
+  expiresAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface MembershipChange {
+  joinedAt: string;
+  leftAt: string | null;
+}
+
+export function affectedRows(result: unknown): number {
+  const parsed = runResultSchema.safeParse(result);
+  if (parsed.success === false) {
+    return 0;
+  }
+  return parsed.data.meta?.changes ?? 0;
+}
+
+export async function readUserById(
+  db: DatabaseBinding,
+  userId: string
+): Promise<StoredUser | null> {
+  const raw = await db
+    .prepare("SELECT id, username, email_verified FROM users WHERE id = ?")
+    .bind(userId)
+    .first();
+  const parsed = userRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    username: parsed.data.username,
+    emailVerified: parsed.data.email_verified
+  };
+}
+
+export async function readEvent(
+  db: DatabaseBinding,
+  eventId: string
+): Promise<StoredEvent | null> {
+  const raw = await db
+    .prepare("SELECT id, status FROM events WHERE id = ?")
+    .bind(eventId)
+    .first();
+  const parsed = eventRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return { id: parsed.data.id, status: parsed.data.status };
+}
+
+export async function readParticipant(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<StoredParticipant | null> {
+  const raw = await db
+    .prepare(
+      "SELECT id, event_id, type, name, event_points, penalty_seconds FROM participants WHERE id = ?"
+    )
+    .bind(participantId)
+    .first();
+  const parsed = participantRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    eventId: parsed.data.event_id,
+    kind: parsed.data.type,
+    name: parsed.data.name,
+    eventPoints: parsed.data.event_points,
+    penaltySeconds: parsed.data.penalty_seconds
+  };
+}
+
+export async function readInviteById(
+  db: DatabaseBinding,
+  inviteId: string
+): Promise<StoredInvite | null> {
+  const raw = await db
+    .prepare(
+      "SELECT id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at FROM team_invites WHERE id = ?"
+    )
+    .bind(inviteId)
+    .first();
+  const parsed = inviteRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    participantId: parsed.data.participant_id,
+    invitedBy: parsed.data.invited_by,
+    tokenHash: parsed.data.token_hash,
+    requestedUserId: parsed.data.requested_user_id,
+    status: parsed.data.status,
+    expiresAt: parsed.data.expires_at,
+    createdAt: parsed.data.created_at,
+    updatedAt: parsed.data.updated_at
+  };
+}
+
+export async function readInviteByTokenHash(
+  db: DatabaseBinding,
+  tokenHash: string
+): Promise<StoredInvite | null> {
+  const raw = await db
+    .prepare(
+      "SELECT id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at FROM team_invites WHERE token_hash = ?"
+    )
+    .bind(tokenHash)
+    .first();
+  const parsed = inviteRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    participantId: parsed.data.participant_id,
+    invitedBy: parsed.data.invited_by,
+    tokenHash: parsed.data.token_hash,
+    requestedUserId: parsed.data.requested_user_id,
+    status: parsed.data.status,
+    expiresAt: parsed.data.expires_at,
+    createdAt: parsed.data.created_at,
+    updatedAt: parsed.data.updated_at
+  };
+}
+
+export async function readActiveMembershipForUserEvent(
+  db: DatabaseBinding,
+  userId: string,
+  eventId: string
+): Promise<StoredMember | null> {
+  const raw = await db
+    .prepare(
+      "SELECT m.id, m.participant_id, m.user_id, m.role, m.joined_at, m.left_at FROM participant_members AS m INNER JOIN participants AS p ON p.id = m.participant_id WHERE m.user_id = ? AND p.event_id = ? AND m.left_at IS NULL"
+    )
+    .bind(userId, eventId)
+    .first();
+  const parsed = memberRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    participantId: parsed.data.participant_id,
+    userId: parsed.data.user_id,
+    role: parsed.data.role,
+    joinedAt: parsed.data.joined_at,
+    leftAt: parsed.data.left_at
+  };
+}
+
+export async function readActiveMemberRow(
+  db: DatabaseBinding,
+  participantId: string,
+  userId: string
+): Promise<StoredMember | null> {
+  const raw = await db
+    .prepare(
+      "SELECT id, participant_id, user_id, role, joined_at, left_at FROM participant_members WHERE participant_id = ? AND user_id = ? AND left_at IS NULL"
+    )
+    .bind(participantId, userId)
+    .first();
+  const parsed = memberRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return {
+    id: parsed.data.id,
+    participantId: parsed.data.participant_id,
+    userId: parsed.data.user_id,
+    role: parsed.data.role,
+    joinedAt: parsed.data.joined_at,
+    leftAt: parsed.data.left_at
+  };
+}
+
+export async function readActiveMembers(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<Array<StoredMemberWithUsername>> {
+  const rows = await db
+    .prepare(
+      "SELECT m.id, m.participant_id, m.user_id, m.role, m.joined_at, m.left_at, u.username AS username FROM participant_members AS m INNER JOIN users AS u ON u.id = m.user_id WHERE m.participant_id = ? AND m.left_at IS NULL ORDER BY m.joined_at ASC"
+    )
+    .bind(participantId)
+    .all();
+  const members: Array<StoredMemberWithUsername> = [];
+  for (const row of rows) {
+    const parsed = memberWithUsernameSchema.safeParse(row);
+    if (parsed.success) {
+      members.push({
+        id: parsed.data.id,
+        participantId: parsed.data.participant_id,
+        userId: parsed.data.user_id,
+        role: parsed.data.role,
+        joinedAt: parsed.data.joined_at,
+        leftAt: parsed.data.left_at,
+        username: parsed.data.username
+      });
+    }
+  }
+  return members;
+}
+
+export async function readUserEventHistory(
+  db: DatabaseBinding,
+  userId: string,
+  eventId: string
+): Promise<Array<MembershipChange>> {
+  const rows = await db
+    .prepare(
+      "SELECT m.joined_at, m.left_at FROM participant_members AS m INNER JOIN participants AS p ON p.id = m.participant_id WHERE m.user_id = ? AND p.event_id = ?"
+    )
+    .bind(userId, eventId)
+    .all();
+  const changes: Array<MembershipChange> = [];
+  for (const row of rows) {
+    const parsed = historyRowSchema.safeParse(row);
+    if (parsed.success) {
+      changes.push({
+        joinedAt: parsed.data.joined_at,
+        leftAt: parsed.data.left_at
+      });
+    }
+  }
+  return changes;
+}
+
+export async function readTeamHistory(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<Array<MembershipChange>> {
+  const rows = await db
+    .prepare(
+      "SELECT joined_at, left_at FROM participant_members WHERE participant_id = ?"
+    )
+    .bind(participantId)
+    .all();
+  const changes: Array<MembershipChange> = [];
+  for (const row of rows) {
+    const parsed = historyRowSchema.safeParse(row);
+    if (parsed.success) {
+      changes.push({
+        joinedAt: parsed.data.joined_at,
+        leftAt: parsed.data.left_at
+      });
+    }
+  }
+  return changes;
+}
+
+export async function countActiveMembers(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<number> {
+  const raw = await db
+    .prepare(
+      "SELECT COUNT(*) AS count FROM participant_members WHERE participant_id = ? AND left_at IS NULL"
+    )
+    .bind(participantId)
+    .first();
+  const parsed = countRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return 0;
+  }
+  return parsed.data.count;
+}
+
+export async function readEarliestCompletion(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<string | null> {
+  const raw = await db
+    .prepare(
+      "SELECT completed_at FROM objective_progress WHERE participant_id = ? AND status = 'completed' AND completed_at IS NOT NULL ORDER BY completed_at ASC LIMIT 1"
+    )
+    .bind(participantId)
+    .first();
+  const parsed = completionRowSchema.safeParse(raw);
+  if (parsed.success === false) {
+    return null;
+  }
+  return parsed.data.completed_at;
+}
+
+export async function requireVerifiedUser(
+  c: AppContext
+): Promise<AuthResult> {
+  const attached = c.get("user");
+  if (attached !== undefined) {
+    const stored = await readUserById(c.env.DB, attached.id);
+    if (stored === null) {
+      return {
+        ok: false,
+        response: errorResponse(c, "UNAUTHENTICATED", "Invalid session")
+      };
+    }
+    if (stored.emailVerified !== 1) {
+      return {
+        ok: false,
+        response: errorResponse(c, "FORBIDDEN", "Email verification required")
+      };
+    }
+    return { ok: true, user: { id: stored.id, username: stored.username } };
+  }
+  const token =
+    c.get("sessionToken") ??
+    getCookie(c, "cmp_session") ??
+    getCookie(c, "session");
+  if (token === undefined || token.length === 0) {
+    return {
+      ok: false,
+      response: errorResponse(c, "UNAUTHENTICATED", "Authentication required")
+    };
+  }
+  const now = nowIso();
+  const tokenHash = await sha256Hex(token);
+  const sessionRaw = await c.env.DB.prepare(
+    "SELECT id, user_id, expires_at, revoked_at FROM sessions WHERE token_hash = ?"
+  )
+    .bind(tokenHash)
+    .first();
+  const session = sessionRowSchema.safeParse(sessionRaw);
+  if (session.success === false) {
+    return {
+      ok: false,
+      response: errorResponse(c, "UNAUTHENTICATED", "Invalid session")
+    };
+  }
+  if (session.data.revoked_at !== null || session.data.expires_at <= now) {
+    return {
+      ok: false,
+      response: errorResponse(c, "UNAUTHENTICATED", "Session expired")
+    };
+  }
+  const user = await readUserById(c.env.DB, session.data.user_id);
+  if (user === null) {
+    return {
+      ok: false,
+      response: errorResponse(c, "UNAUTHENTICATED", "Invalid session")
+    };
+  }
+  if (user.emailVerified !== 1) {
+    return {
+      ok: false,
+      response: errorResponse(c, "FORBIDDEN", "Email verification required")
+    };
+  }
+  return { ok: true, user: { id: user.id, username: user.username } };
+}
+
+export function userCooldownRemainingSeconds(
+  changes: Array<MembershipChange>,
+  nowMs: number
+): number {
+  const windowMs = JOIN_LEAVE_COOLDOWN_SECONDS * 1000;
+  let latest = 0;
+  for (const change of changes) {
+    const joinedMs = Date.parse(change.joinedAt);
+    if (Number.isNaN(joinedMs) === false && joinedMs > latest) {
+      latest = joinedMs;
+    }
+    if (change.leftAt !== null) {
+      const leftMs = Date.parse(change.leftAt);
+      if (Number.isNaN(leftMs) === false && leftMs > latest) {
+        latest = leftMs;
+      }
+    }
+  }
+  if (latest === 0) {
+    return 0;
+  }
+  const elapsedMs = nowMs - latest;
+  if (elapsedMs >= windowMs) {
+    return 0;
+  }
+  return Math.ceil((windowMs - elapsedMs) / 1000);
+}
+
+export function countRecentTeamChanges(
+  changes: Array<MembershipChange>,
+  nowMs: number
+): number {
+  const windowMs = TEAM_APPROVAL_WINDOW_SECONDS * 1000;
+  let total = 0;
+  for (const change of changes) {
+    const joinedMs = Date.parse(change.joinedAt);
+    if (Number.isNaN(joinedMs) === false && nowMs - joinedMs < windowMs) {
+      total += 1;
+    }
+    if (change.leftAt !== null) {
+      const leftMs = Date.parse(change.leftAt);
+      if (Number.isNaN(leftMs) === false && nowMs - leftMs < windowMs) {
+        total += 1;
+      }
+    }
+  }
+  return total;
+}
 
 export const teamsRouter = new Hono<AppEnv>();
 
@@ -35,11 +569,100 @@ teamsRouter.post("/api/events/:eventId/teams", async (c) => {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid event id");
   }
   const raw: unknown = await c.req.json().catch(() => ({}));
-  const body = createTeamBody.safeParse(raw);
+  const body = createTeamSchema.safeParse(raw);
   if (body.success === false) {
-    return errorResponse(c, "VALIDATION_ERROR", "A team name is required");
+    const message =
+      body.error.issues[0]?.message ?? "Invalid team name";
+    return errorResponse(c, "VALIDATION_ERROR", message);
   }
-  return notImplemented(c, "POST /api/events/:eventId/teams");
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const db = c.env.DB;
+  const now = nowIso();
+  const eventId = params.data.eventId;
+  const event = await readEvent(db, eventId);
+  if (event === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const clash = await db
+    .prepare(
+      "SELECT id FROM participants WHERE event_id = ? AND type = 'team' AND name = ? COLLATE NOCASE"
+    )
+    .bind(eventId, body.data.name)
+    .first();
+  if (clash !== null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Team name already taken for this event"
+    );
+  }
+  const existing = await readActiveMembershipForUserEvent(
+    db,
+    auth.user.id,
+    eventId
+  );
+  if (existing !== null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Already participating in this event"
+    );
+  }
+  const history = await readUserEventHistory(db, auth.user.id, eventId);
+  const cooldown = userCooldownRemainingSeconds(history, Date.parse(now));
+  if (cooldown > 0) {
+    return errorResponse(
+      c,
+      "MEMBERSHIP_COOLDOWN",
+      "Membership changed too recently",
+      { details: { retryAfterSeconds: cooldown } }
+    );
+  }
+  const participantId = newId();
+  await db.batch([
+    db
+      .prepare(
+        "INSERT INTO participants (id, event_id, type, name, event_points, penalty_seconds, started_at, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+      .bind(
+        participantId,
+        eventId,
+        "team",
+        body.data.name,
+        0,
+        0,
+        null,
+        null,
+        now,
+        now
+      ),
+    db
+      .prepare(
+        "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, ?, ?)"
+      )
+      .bind(newId(), participantId, auth.user.id, "captain", now, null)
+  ]);
+  return c.json(
+    {
+      participant: {
+        id: participantId,
+        eventId,
+        type: "team",
+        name: body.data.name,
+        penaltySeconds: 0
+      },
+      captain: {
+        userId: auth.user.id,
+        username: auth.user.username,
+        role: "captain",
+        joinedAt: now
+      }
+    },
+    201
+  );
 });
 
 teamsRouter.post("/api/participants/:participantId/invites", async (c) => {
@@ -50,39 +673,386 @@ teamsRouter.post("/api/participants/:participantId/invites", async (c) => {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid participant id");
   }
   const raw: unknown = await c.req.json().catch(() => ({}));
-  const body = createInviteBody.safeParse(raw);
+  const body = createInviteSchema.safeParse(raw);
   if (body.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid invite options");
   }
-  return notImplemented(c, "POST /api/participants/:participantId/invites");
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const db = c.env.DB;
+  const now = nowIso();
+  const participant = await readParticipant(db, params.data.participantId);
+  if (participant === null) {
+    return errorResponse(c, "NOT_FOUND", "Participant not found");
+  }
+  if (participant.kind !== "team") {
+    return errorResponse(c, "CONFLICT", "Only teams can create invites");
+  }
+  const caller = await readActiveMemberRow(
+    db,
+    participant.id,
+    auth.user.id
+  );
+  if (caller === null || canManageMembers(caller.role) === false) {
+    return errorResponse(
+      c,
+      "FORBIDDEN",
+      "Only the captain or a member manager can invite"
+    );
+  }
+  const expiresAt =
+    body.data.expiresAt ??
+    new Date(Date.parse(now) + DEFAULT_INVITE_EXPIRY_SECONDS * 1000).toISOString();
+  if (expiresAt <= now) {
+    return errorResponse(
+      c,
+      "VALIDATION_ERROR",
+      "Invite expiry must be in the future"
+    );
+  }
+  const token = `${newId()}${newId()}`;
+  const tokenHash = await sha256Hex(token);
+  const inviteId = newId();
+  await db
+    .prepare(
+      "INSERT INTO team_invites (id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
+    )
+    .bind(
+      inviteId,
+      participant.id,
+      auth.user.id,
+      tokenHash,
+      null,
+      expiresAt,
+      now,
+      now
+    )
+    .run();
+  return c.json(
+    {
+      invite: {
+        id: inviteId,
+        participantId: participant.id,
+        status: "pending",
+        expiresAt
+      },
+      token
+    },
+    201
+  );
 });
 
-teamsRouter.post("/api/invites/:token/request", (c) => {
-  const parsed = inviteTokenParams.safeParse({
+teamsRouter.post("/api/invites/:token/request", async (c) => {
+  const params = inviteTokenParams.safeParse({
     token: c.req.param("token")
   });
-  if (parsed.success === false) {
+  if (params.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid invite token");
   }
-  return notImplemented(c, "POST /api/invites/:token/request");
+  const db = c.env.DB;
+  const now = nowIso();
+  const tokenHash = await sha256Hex(params.data.token);
+  const invite = await readInviteByTokenHash(db, tokenHash);
+  if (
+    invite === null ||
+    invite.status !== "pending" ||
+    invite.tokenHash === null
+  ) {
+    return errorResponse(c, "NOT_FOUND", "Invite not found or expired");
+  }
+  if (invite.expiresAt !== null && invite.expiresAt <= now) {
+    await db
+      .prepare(
+        "UPDATE team_invites SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'"
+      )
+      .bind("expired", now, invite.id)
+      .run();
+    return errorResponse(c, "NOT_FOUND", "Invite expired");
+  }
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const participant = await readParticipant(db, invite.participantId);
+  if (participant === null || participant.kind !== "team") {
+    return errorResponse(c, "NOT_FOUND", "Team not found");
+  }
+  const existing = await readActiveMembershipForUserEvent(
+    db,
+    auth.user.id,
+    participant.eventId
+  );
+  if (existing !== null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Already participating in this event"
+    );
+  }
+  const duplicate = await db
+    .prepare(
+      "SELECT id FROM team_invites WHERE participant_id = ? AND requested_user_id = ? AND status = 'pending'"
+    )
+    .bind(participant.id, auth.user.id)
+    .first();
+  if (duplicate !== null) {
+    return errorResponse(c, "CONFLICT", "Join request already pending");
+  }
+  const history = await readUserEventHistory(
+    db,
+    auth.user.id,
+    participant.eventId
+  );
+  const cooldown = userCooldownRemainingSeconds(history, Date.parse(now));
+  if (cooldown > 0) {
+    return errorResponse(
+      c,
+      "MEMBERSHIP_COOLDOWN",
+      "Membership changed too recently",
+      { details: { retryAfterSeconds: cooldown } }
+    );
+  }
+  const requestId = newId();
+  await db
+    .prepare(
+      "INSERT INTO team_invites (id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
+    )
+    .bind(
+      requestId,
+      participant.id,
+      auth.user.id,
+      null,
+      auth.user.id,
+      invite.expiresAt,
+      now,
+      now
+    )
+    .run();
+  const earliestCompletion = await readEarliestCompletion(db, participant.id);
+  return c.json(
+    {
+      request: {
+        id: requestId,
+        participantId: participant.id,
+        status: "pending",
+        createdAt: now
+      },
+      wouldIncurLateJoinPenalty: earliestCompletion !== null
+    },
+    201
+  );
 });
 
-teamsRouter.post("/api/join-requests/:requestId/approve", (c) => {
-  const parsed = requestIdParams.safeParse({
+teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
+  const params = requestIdParams.safeParse({
     requestId: c.req.param("requestId")
   });
-  if (parsed.success === false) {
+  if (params.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid request id");
   }
-  return notImplemented(c, "POST /api/join-requests/:requestId/approve");
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const db = c.env.DB;
+  const now = nowIso();
+  const nowMs = Date.parse(now);
+  const request = await readInviteById(db, params.data.requestId);
+  if (request === null) {
+    return errorResponse(c, "NOT_FOUND", "Join request not found");
+  }
+  if (request.requestedUserId === null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Invite links cannot be approved directly"
+    );
+  }
+  if (request.status !== "pending") {
+    return errorResponse(c, "CONFLICT", "Join request already decided");
+  }
+  const participant = await readParticipant(db, request.participantId);
+  if (participant === null || participant.kind !== "team") {
+    return errorResponse(c, "NOT_FOUND", "Team not found");
+  }
+  const approver = await readActiveMemberRow(
+    db,
+    participant.id,
+    auth.user.id
+  );
+  if (approver === null || canManageMembers(approver.role) === false) {
+    return errorResponse(
+      c,
+      "FORBIDDEN",
+      "Only the captain or a member manager can approve requests"
+    );
+  }
+  const target = await readUserById(db, request.requestedUserId);
+  if (target === null) {
+    return errorResponse(c, "NOT_FOUND", "Requesting user not found");
+  }
+  const targetActive = await readActiveMembershipForUserEvent(
+    db,
+    target.id,
+    participant.eventId
+  );
+  if (targetActive !== null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "User already participates in this event"
+    );
+  }
+  const targetHistory = await readUserEventHistory(
+    db,
+    target.id,
+    participant.eventId
+  );
+  const targetCooldown = userCooldownRemainingSeconds(targetHistory, nowMs);
+  if (targetCooldown > 0) {
+    return errorResponse(
+      c,
+      "MEMBERSHIP_COOLDOWN",
+      "User changed membership too recently",
+      { details: { retryAfterSeconds: targetCooldown } }
+    );
+  }
+  const teamHistory = await readTeamHistory(db, participant.id);
+  if (
+    countRecentTeamChanges(teamHistory, nowMs) >=
+    MAX_MEMBERSHIP_CHANGES_PER_WINDOW
+  ) {
+    return errorResponse(
+      c,
+      "MEMBERSHIP_COOLDOWN",
+      "Team changed membership too often"
+    );
+  }
+  const activeCount = await countActiveMembers(db, participant.id);
+  if (activeCount >= MAX_TEAM_SIZE) {
+    return errorResponse(c, "TEAM_FULL", "Team is full");
+  }
+  const earliestCompletion = await readEarliestCompletion(db, participant.id);
+  const penalty =
+    earliestCompletion === null ? 0 : LATE_JOIN_PENALTY_SECONDS;
+  const memberId = newId();
+  const statements: Array<PreparedStatementBinding> = [
+    db
+      .prepare(
+        "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT COUNT(*) FROM participant_members WHERE participant_id = ? AND left_at IS NULL) < ? AND NOT EXISTS (SELECT 1 FROM participant_members WHERE participant_id = ? AND user_id = ? AND left_at IS NULL) AND EXISTS (SELECT 1 FROM team_invites WHERE id = ? AND status = 'pending')"
+      )
+      .bind(
+        memberId,
+        participant.id,
+        target.id,
+        "member",
+        now,
+        null,
+        participant.id,
+        MAX_TEAM_SIZE,
+        participant.id,
+        target.id,
+        request.id
+      ),
+    db
+      .prepare(
+        "UPDATE team_invites SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending' AND EXISTS (SELECT 1 FROM participant_members WHERE id = ?)"
+      )
+      .bind("approved", now, request.id, memberId)
+  ];
+  if (penalty > 0) {
+    statements.push(
+      db
+        .prepare(
+          "UPDATE participants SET penalty_seconds = penalty_seconds + ?, updated_at = ? WHERE id = ? AND EXISTS (SELECT 1 FROM participant_members WHERE id = ?)"
+        )
+        .bind(penalty, now, participant.id, memberId)
+    );
+  }
+  const results = await db.batch(statements);
+  if (affectedRows(results[0]) !== 1) {
+    const freshCount = await countActiveMembers(db, participant.id);
+    if (freshCount >= MAX_TEAM_SIZE) {
+      return errorResponse(c, "TEAM_FULL", "Team is full");
+    }
+    return errorResponse(c, "CONFLICT", "Unable to approve join request");
+  }
+  if (affectedRows(results[1]) !== 1) {
+    return errorResponse(c, "CONFLICT", "Join request already decided");
+  }
+  if (penalty > 0 && affectedRows(results[2]) !== 1) {
+    return errorResponse(
+      c,
+      "INTERNAL",
+      "Membership approved but the late-join penalty was not recorded"
+    );
+  }
+  return c.json({
+    member: {
+      userId: target.id,
+      username: target.username,
+      role: "member",
+      joinedAt: now
+    },
+    request: { id: request.id, status: "approved" },
+    lateJoinPenaltyApplied: penalty > 0,
+    penaltySeconds: participant.penaltySeconds + penalty
+  });
 });
 
-teamsRouter.post("/api/join-requests/:requestId/reject", (c) => {
-  const parsed = requestIdParams.safeParse({
+teamsRouter.post("/api/join-requests/:requestId/reject", async (c) => {
+  const params = requestIdParams.safeParse({
     requestId: c.req.param("requestId")
   });
-  if (parsed.success === false) {
+  if (params.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid request id");
   }
-  return notImplemented(c, "POST /api/join-requests/:requestId/reject");
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const db = c.env.DB;
+  const now = nowIso();
+  const request = await readInviteById(db, params.data.requestId);
+  if (request === null) {
+    return errorResponse(c, "NOT_FOUND", "Join request not found");
+  }
+  if (request.requestedUserId === null) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Invite links cannot be rejected directly"
+    );
+  }
+  if (request.status !== "pending") {
+    return errorResponse(c, "CONFLICT", "Join request already decided");
+  }
+  const participant = await readParticipant(db, request.participantId);
+  if (participant === null || participant.kind !== "team") {
+    return errorResponse(c, "NOT_FOUND", "Team not found");
+  }
+  const approver = await readActiveMemberRow(
+    db,
+    participant.id,
+    auth.user.id
+  );
+  if (approver === null || canManageMembers(approver.role) === false) {
+    return errorResponse(
+      c,
+      "FORBIDDEN",
+      "Only the captain or a member manager can reject requests"
+    );
+  }
+  const updated = await db
+    .prepare(
+      "UPDATE team_invites SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'"
+    )
+    .bind("rejected", now, request.id)
+    .run();
+  if (affectedRows(updated) !== 1) {
+    return errorResponse(c, "CONFLICT", "Join request already decided");
+  }
+  return c.json({ request: { id: request.id, status: "rejected" } });
 });
