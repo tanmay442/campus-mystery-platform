@@ -5,15 +5,15 @@ Every item below ships with real server validation, migrations, tests, and types
 
 ## Scope
 
-- [ ] Auth + profiles: verified accounts, unique usernames, session + 2-device policy
-- [ ] Event model + lifecycle: draft → testing → scheduled → live → paused → completed → archived
-- [ ] Unified solo/team participant model (one progression path, max 5 members)
-- [ ] Team invitations, join requests, approvals, leave, captain transfer
-- [ ] Challenge rendering: text, choice, code, location objectives (Phase 1 subset)
-- [ ] Objective-level autosaving (upsert on participant+challenge+objective_key)
-- [ ] Event points + platform credits (atomic balance + transaction ledger)
-- [ ] Basic leaderboard: top 10 + current rank, server official finish time
-- [ ] Protected admin event/challenge forms + admin API auth (allowlist email)
+- [x] Auth + profiles: verified accounts, unique usernames, session + 2-device policy
+- [x] Event model + lifecycle: draft → testing → scheduled → live → paused → completed → archived
+- [x] Unified solo/team participant model (one progression path, max 5 members)
+- [x] Team invitations, join requests, approvals, leave, captain transfer
+- [x] Challenge rendering: text, choice, code, location objectives (Phase 1 subset)
+- [x] Objective-level autosaving (upsert on participant+challenge+objective_key)
+- [x] Event points + platform credits (atomic balance + transaction ledger)
+- [x] Basic leaderboard: top 10 + current rank, server official finish time
+- [ ] Protected admin event/challenge forms + admin API auth (allowlist email) — event admin APIs + audit done; challenge CRUD, manual completion, waivers pending; frontend forms deferred with UI
 
 ## Deferred to Phase 2+
 

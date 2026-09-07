@@ -41,6 +41,11 @@ Never commit real secret values.
 Separate local / preview-staging / production. Each gets its own D1 database,
 R2 bucket, Turnstile keys, and secrets. See `apps/worker/wrangler.jsonc`.
 
+Live-resource inventory, hosted-change history, and the freeze policy live in
+`docs/cloudflare.md` — read it before running any Cloudflare command. Only
+the resources named there may ever be used; everything else in the account
+is out of scope.
+
 ## Repo standards
 
 - TypeScript strict (`tsconfig.base.json`: `noUncheckedIndexedAccess`,

@@ -52,7 +52,10 @@ wrangler secret put ADMIN_EMAILS --env staging
 
 `wrangler.jsonc` keeps `ADMIN_EMAILS` empty on purpose. The comment next to
 it explains that the real value is set through the Cloudflare
-dashboard or `wrangler secret put`, so no allowlist ever lands in git.
+dashboard, `wrangler secret put`, or an approved deploy flag, so no
+allowlist ever lands in git. Staging currently receives it as a deploy
+`--var` flag (see `docs/cloudflare.md`); the secrets path remains the
+preferred long-term setup.
 
 ## Deploy
 
@@ -72,8 +75,9 @@ The bare `deploy` targets the top-level (development) environment.
 | staging | campus-mystery-staging | campus-mystery-media-staging | staging |
 | production | campus-mystery-production | campus-mystery-media-production | production |
 
-Bindings carry no IDs in `wrangler.jsonc`. Wrangler auto-provisions each
-named database and bucket per environment on first deploy.
+Bindings resolve to the real IDs in `wrangler.jsonc`, which match the
+`docs/cloudflare.md` inventory. Never change them without an approved
+session decision.
 
 ## Types
 
