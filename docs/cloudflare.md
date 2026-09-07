@@ -50,6 +50,29 @@ Nothing else. No secrets set, no production writes, no deletions.
 - Any worker, database, bucket, zone, secret, or account setting not named
   in the inventory table above.
 
+## Skill compliance (reviewed 2026-09-07)
+
+Checked against the Cloudflare skill references (`d1`, `workers`, `r2`
+gotchas + configuration) and `workers-best-practices` / `wrangler` skills:
+
+- Compliant: prepared statements + `bind()` everywhere (IN-lists use bound
+  placeholders); INTEGER 0/1 booleans; ISO-8601 TEXT timestamps; indexes on
+  FK columns; `nodejs_compat` on; recent `compatibility_date`; no
+  module-level request state (the JWKS key cache is URL-keyed config, not
+  request data); observability enabled; Hono as the Workers-native router.
+- Known limitation, no change: D1 read-after-write is eventually
+  consistent and the Sessions API is paid-only, so mutating routes rely on
+  single-statement conditional writes (`affectedRows` guards) instead of
+  read-your-write. Any flow that re-reads after writing must tolerate
+  staleness or restructure into conditional writes.
+- Known limitation, no change: `PRAGMA foreign_keys` is per-connection and
+  has no effect from migrations on serverless D1; integrity is enforced at
+  the application layer (capacity, membership, idempotency constraints).
+- R2 media uploads are not implemented yet. When they are: validate keys
+  (reject `..`/leading `/`), buffer streams or pass Content-Length, follow
+  `references/r2/gotchas.md`, and use `turnstile-spin` + `references/
+  turnstile/` for the Turnstile step once keys exist.
+
 ## Freeze policy (mandatory for every session)
 
 1. The inventory table above is the complete set of Cloudflare resources
