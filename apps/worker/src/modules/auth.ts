@@ -1,6 +1,8 @@
 /** Auth endpoints: provider login exchange, session logout, profile read and update. */
 import { Hono } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+import type { JWTVerifyGetKey } from "jose";
 import { z } from "zod";
 import type { AppEnv, Env } from "../env";
 import { newId, sha256Hex } from "../lib/crypto";
@@ -33,13 +35,24 @@ const presenceVisibilitySchema = z.enum([
   "hidden",
 ]);
 
-const loginBodySchema = z.object({
-  providerToken: z.string().min(1).max(2048),
+const loginOptionalFields = {
   username: usernameSchema.optional(),
   displayName: displayNameSchema.optional(),
   deviceLabel: deviceLabelSchema.optional(),
   turnstileToken: z.string().min(1).max(2048).optional(),
-});
+};
+
+const loginBodySchema = z.union([
+  z.object({
+    providerToken: z.string().min(1).max(2048),
+    ...loginOptionalFields,
+  }),
+  z.object({
+    provider: z.enum(["dev", "clerk"]),
+    token: z.string().min(1).max(2048),
+    ...loginOptionalFields,
+  }),
+]);
 
 const updateProfileBodySchema = z.object({
   username: usernameSchema.optional(),
@@ -138,6 +151,101 @@ export class DevProvider implements AuthProvider {
   }
 }
 
+export class ClerkVerificationError extends AuthProviderError {}
+
+export interface ClerkProviderConfig {
+  jwksUrl: string;
+  issuer: string;
+  getKey?: JWTVerifyGetKey;
+}
+
+const clerkClaimsSchema = z
+  .object({
+    sub: z.string().min(1),
+    email: z.string().email(),
+    email_verified: z.boolean(),
+  })
+  .catchall(z.unknown());
+
+const clerkEnvSchema = z
+  .object({ CLERK_JWKS_URL: z.string().min(1).max(2048) })
+  .catchall(z.unknown());
+
+const CLERK_JWKS_SUFFIX = "/.well-known/jwks.json";
+
+const clerkJwksCache = new Map<string, JWTVerifyGetKey>();
+
+function clerkJwksFor(url: string): JWTVerifyGetKey {
+  const cached = clerkJwksCache.get(url);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const created = createRemoteJWKSet(new URL(url));
+  clerkJwksCache.set(url, created);
+  return created;
+}
+
+function clerkJwksUrlFromEnv(env: Env): string | undefined {
+  const parsed = clerkEnvSchema.safeParse(env);
+  if (parsed.success === false) {
+    return undefined;
+  }
+  return parsed.data.CLERK_JWKS_URL;
+}
+
+function clerkIssuerFromJwksUrl(jwksUrl: string): string {
+  if (jwksUrl.endsWith(CLERK_JWKS_SUFFIX)) {
+    return jwksUrl.slice(0, jwksUrl.length - CLERK_JWKS_SUFFIX.length);
+  }
+  return jwksUrl;
+}
+
+export class ClerkProvider implements AuthProvider {
+  constructor(private readonly config: ClerkProviderConfig) {}
+
+  async verifyToken(token: string): Promise<VerifiedIdentity> {
+    try {
+      const verified = await jwtVerify(
+        token,
+        this.config.getKey ?? clerkJwksFor(this.config.jwksUrl),
+        { issuer: this.config.issuer },
+      );
+      const claims = clerkClaimsSchema.safeParse(verified.payload);
+      if (claims.success === false || claims.data.email_verified !== true) {
+        throw new ClerkVerificationError("Invalid Clerk session");
+      }
+      return {
+        providerId: `clerk:${claims.data.sub}`,
+        email: claims.data.email,
+        emailVerified: true,
+      };
+    } catch (err: unknown) {
+      if (err instanceof ClerkVerificationError) {
+        throw err;
+      }
+      throw new ClerkVerificationError("Invalid Clerk session");
+    }
+  }
+}
+
+export function clerkProviderFromEnv(
+  env: Env,
+  overrides?: { issuer?: string; getKey?: JWTVerifyGetKey },
+): ClerkProvider {
+  const jwksUrl = clerkJwksUrlFromEnv(env);
+  if (jwksUrl === undefined) {
+    throw new ClerkVerificationError("Clerk authentication is not configured");
+  }
+  const config: ClerkProviderConfig = {
+    jwksUrl,
+    issuer: overrides?.issuer ?? clerkIssuerFromJwksUrl(jwksUrl),
+  };
+  if (overrides?.getKey !== undefined) {
+    config.getKey = overrides.getKey;
+  }
+  return new ClerkProvider(config);
+}
+
 export interface OidcConfig {
   issuer: string;
   audience: string;
@@ -179,6 +287,9 @@ function providerErrorResponse(c: AppContext, err: unknown): Response {
       "FORBIDDEN",
       "Development sign-in is disabled in production",
     );
+  }
+  if (err instanceof ClerkVerificationError) {
+    return errorResponse(c, "FORBIDDEN", "Invalid authentication token");
   }
   if (err instanceof InvalidProviderTokenError) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid authentication token");
@@ -257,7 +368,6 @@ async function loadUserById(
 
 export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
   const router = new Hono<AppEnv>();
-  const resolve = deps?.resolveProvider ?? selectProvider;
 
   router.post("/api/auth/login", async (c) => {
     const raw: unknown = await c.req.json().catch(() => undefined);
@@ -266,6 +376,8 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
       return errorResponse(c, "VALIDATION_ERROR", "Invalid login request");
     }
     const body = parsed.data;
+    const explicitProvider = "provider" in body ? body.provider : undefined;
+    const rawToken = "providerToken" in body ? body.providerToken : body.token;
 
     if (turnstileRequired(c.env)) {
       if (body.turnstileToken === undefined) {
@@ -287,9 +399,17 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
 
     let identity: VerifiedIdentity;
     try {
-      identity = await resolve(body.providerToken, c.env).verifyToken(
-        body.providerToken,
-      );
+      let provider: AuthProvider;
+      if (deps?.resolveProvider !== undefined) {
+        provider = deps.resolveProvider(rawToken, c.env);
+      } else if (explicitProvider === "clerk") {
+        provider = clerkProviderFromEnv(c.env);
+      } else if (explicitProvider === "dev") {
+        provider = new DevProvider(c.env.ENVIRONMENT);
+      } else {
+        provider = selectProvider(rawToken, c.env);
+      }
+      identity = await provider.verifyToken(rawToken);
     } catch (err: unknown) {
       return providerErrorResponse(c, err);
     }

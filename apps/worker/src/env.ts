@@ -44,6 +44,7 @@ export interface Env {
   ENVIRONMENT?: string;
   SESSION_SECRET?: string;
   TURNSTILE_SECRET_KEY?: string;
+  CLERK_JWKS_URL?: string;
 }
 
 export interface AppVariables {

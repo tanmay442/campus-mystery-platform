@@ -1,5 +1,6 @@
-/** Auth login exchange, session cookies, device eviction, and logout tests. */
+/** Auth login exchange, session cookies, device eviction, logout, and Clerk JWT tests. */
 import { Hono } from "hono";
+import { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } from "jose";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
 import type {
@@ -11,7 +12,7 @@ import type {
 import app from "../index";
 import { sha256Hex } from "../lib/crypto";
 import { authMiddleware } from "../middleware/auth";
-import { createAuthRouter } from "./auth";
+import { ClerkProvider, createAuthRouter } from "./auth";
 import type { AuthProvider, VerifiedIdentity } from "./auth";
 
 type Row = Record<string, unknown>;
@@ -653,5 +654,191 @@ describe("auth login and profile roundtrip", () => {
     }
     const expired = await meRequest(db, freshCookie);
     expect(expired.status).toBe(401);
+  });
+});
+
+interface ClerkHarness {
+  router: Hono<AppEnv>;
+  db: FakeDb;
+  sign: (input: {
+    subject: string;
+    email?: string;
+    emailVerified?: boolean;
+    issuer?: string;
+    expired?: boolean;
+  }) => Promise<string>;
+}
+
+async function createClerkHarness(issuer: string): Promise<ClerkHarness> {
+  const pair = await generateKeyPair("RS256");
+  const kid = "test-key-1";
+  const publicJwk = await exportJWK(pair.publicKey);
+  const getKey = createLocalJWKSet({
+    keys: [{ ...publicJwk, kid, alg: "RS256", use: "sig" }],
+  });
+  const db = new FakeDb();
+  const router = new Hono<AppEnv>();
+  router.use("/api/*", authMiddleware);
+  router.route(
+    "/",
+    createAuthRouter({
+      resolveProvider: () =>
+        new ClerkProvider({
+          jwksUrl: `${issuer}/.well-known/jwks.json`,
+          issuer,
+          getKey,
+        }),
+    }),
+  );
+  const sign = async (input: {
+    subject: string;
+    email?: string;
+    emailVerified?: boolean;
+    issuer?: string;
+    expired?: boolean;
+  }): Promise<string> => {
+    const jwt = new SignJWT({
+      email: input.email ?? "student@example.com",
+      email_verified: input.emailVerified ?? true,
+    })
+      .setProtectedHeader({ alg: "RS256", kid })
+      .setIssuer(input.issuer ?? issuer)
+      .setSubject(input.subject);
+    if (input.expired === true) {
+      jwt.setExpirationTime(Math.floor(Date.now() / 1000) - 60);
+    } else {
+      jwt.setExpirationTime("1h");
+    }
+    return jwt.sign(pair.privateKey);
+  };
+  return { router, db, sign };
+}
+
+async function clerkLoginRequest(
+  harness: ClerkHarness,
+  body: Record<string, unknown>,
+): Promise<Response> {
+  return harness.router.request(
+    "/api/auth/login",
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    },
+    testEnv(harness.db),
+  );
+}
+
+describe("clerk session JWT login", () => {
+  it("accepts a valid clerk session and links it to a stable provider id", async () => {
+    const harness = await createClerkHarness("https://clerk-test.dev");
+    const token = await harness.sign({ subject: "user_abc123" });
+    const login = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token,
+      username: "clerk_student",
+    });
+    expect(login.status).toBe(200);
+    const parsedLogin = loginSchema.safeParse(await login.json());
+    expect(parsedLogin.success).toBe(true);
+    if (parsedLogin.success === false) {
+      return;
+    }
+    expect(parsedLogin.data.user.email).toBe("student@example.com");
+    expect(parsedLogin.data.user.username).toBe("clerk_student");
+    expect(harness.db.users).toHaveLength(1);
+    const stored = harness.db.users[0];
+    expect(stored?.["auth_provider_id"]).toBe("clerk:user_abc123");
+
+    const again = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token,
+    });
+    expect(again.status).toBe(200);
+    const parsedAgain = loginSchema.safeParse(await again.json());
+    expect(parsedAgain.success).toBe(true);
+    if (parsedAgain.success) {
+      expect(parsedAgain.data.user.id).toBe(parsedLogin.data.user.id);
+    }
+    expect(harness.db.users).toHaveLength(1);
+  });
+
+  it("rejects an expired clerk session without creating an account", async () => {
+    const harness = await createClerkHarness("https://clerk-test.dev");
+    const token = await harness.sign({
+      subject: "user_expired",
+      expired: true,
+    });
+    const res = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token,
+      username: "expired_student",
+    });
+    expect(res.status).toBe(403);
+    const envelope = envelopeSchema.safeParse(await res.json());
+    expect(envelope.success).toBe(true);
+    if (envelope.success) {
+      expect(envelope.data.code).toBe("FORBIDDEN");
+    }
+    expect(harness.db.users).toHaveLength(0);
+  });
+
+  it("rejects a clerk session from the wrong issuer", async () => {
+    const harness = await createClerkHarness("https://clerk-test.dev");
+    const token = await harness.sign({
+      subject: "user_other_issuer",
+      issuer: "https://attacker.example.com",
+    });
+    const res = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token,
+      username: "other_issuer",
+    });
+    expect(res.status).toBe(403);
+    const envelope = envelopeSchema.safeParse(await res.json());
+    expect(envelope.success).toBe(true);
+    if (envelope.success) {
+      expect(envelope.data.code).toBe("FORBIDDEN");
+    }
+    expect(harness.db.users).toHaveLength(0);
+  });
+
+  it("rejects a clerk session with an unverified email", async () => {
+    const harness = await createClerkHarness("https://clerk-test.dev");
+    const token = await harness.sign({
+      subject: "user_unverified",
+      emailVerified: false,
+    });
+    const res = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token,
+      username: "unverified_student",
+    });
+    expect(res.status).toBe(403);
+    const envelope = envelopeSchema.safeParse(await res.json());
+    expect(envelope.success).toBe(true);
+    if (envelope.success) {
+      expect(envelope.data.code).toBe("FORBIDDEN");
+    }
+    expect(harness.db.users).toHaveLength(0);
+  });
+
+  it("rejects a clerk session with a tampered signature", async () => {
+    const harness = await createClerkHarness("https://clerk-test.dev");
+    const token = await harness.sign({ subject: "user_tampered" });
+    const last = token.slice(-1);
+    const tampered = `${token.slice(0, -1)}${last === "a" ? "b" : "a"}`;
+    const res = await clerkLoginRequest(harness, {
+      provider: "clerk",
+      token: tampered,
+      username: "tampered_student",
+    });
+    expect(res.status).toBe(403);
+    const envelope = envelopeSchema.safeParse(await res.json());
+    expect(envelope.success).toBe(true);
+    if (envelope.success) {
+      expect(envelope.data.code).toBe("FORBIDDEN");
+    }
+    expect(harness.db.users).toHaveLength(0);
   });
 });

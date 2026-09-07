@@ -1,46 +1,65 @@
-import { useState } from "react";
-import type { FormEvent } from "react";
+/** Clerk sign-in page exchanging the session JWT for the app session cookie. */
+import { useEffect, useRef, useState } from "react";
+import { SignIn, useAuth } from "@clerk/react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Navigate } from "react-router";
+import { ApiError } from "../lib/api";
+import { exchangeClerkSession } from "../lib/session";
 
-type SubmitState = "idle" | "pending" | "success" | "failure";
+type ExchangeState = "idle" | "pending" | "success" | "failure";
 
 export default function Login() {
-  const [email, setEmail] = useState("");
-  const [state, setState] = useState<SubmitState>("idle");
+  const { isLoaded, isSignedIn, getToken } = useAuth();
+  const queryClient = useQueryClient();
+  const [state, setState] = useState<ExchangeState>("idle");
+  const [message, setMessage] = useState("");
+  const attempted = useRef(false);
 
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (state === "pending") return;
-    if (email.trim().length === 0) {
-      setState("failure");
-      return;
-    }
+  useEffect(() => {
+    if (!isLoaded || !isSignedIn || attempted.current) return;
+    attempted.current = true;
     setState("pending");
-    window.setTimeout(() => setState("success"), 600);
+    setMessage("");
+    exchangeClerkSession(getToken, queryClient).then(
+      () => {
+        setState("success");
+      },
+      (error: unknown) => {
+        attempted.current = false;
+        setState("failure");
+        setMessage(error instanceof ApiError ? error.message : "Could not finish signing in. Retry.");
+      }
+    );
+  }, [isLoaded, isSignedIn, getToken, queryClient]);
+
+  if (!isLoaded) {
+    return (
+      <main>
+        <p role="status">Loading sign-in…</p>
+      </main>
+    );
+  }
+
+  if (!isSignedIn) {
+    return (
+      <main>
+        <h1>Sign in</h1>
+        <SignIn forceRedirectUrl="/login" />
+      </main>
+    );
+  }
+
+  if (state === "success") {
+    return <Navigate to="/" replace />;
   }
 
   return (
     <main>
       <h1>Sign in</h1>
-      <p>Accounts are open to everyone. Email verification is required before you can join an event.</p>
-      <form onSubmit={handleSubmit} aria-label="Sign in">
-        <label htmlFor="login-email">Email address</label>
-        <input
-          id="login-email"
-          name="email"
-          type="email"
-          autoComplete="email"
-          required
-          value={email}
-          onChange={(event) => setEmail(event.target.value)}
-        />
-        <div id="turnstile-mount" role="region" aria-label="Bot verification" />
-        <button type="submit" disabled={state === "pending"} aria-busy={state === "pending"}>
-          {state === "pending" ? "Signing in…" : "Continue with email"}
-        </button>
-      </form>
       <div aria-live="polite">
-        {state === "success" ? <p role="status">Check your inbox for a verification link.</p> : null}
-        {state === "failure" ? <p role="alert">Enter a valid email address to continue.</p> : null}
+        {state === "idle" ? <p role="status">Preparing your session…</p> : null}
+        {state === "pending" ? <p role="status">Finishing sign-in…</p> : null}
+        {state === "failure" ? <p role="alert">{message}</p> : null}
       </div>
     </main>
   );

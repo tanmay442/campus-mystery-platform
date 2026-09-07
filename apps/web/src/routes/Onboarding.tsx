@@ -1,4 +1,6 @@
-import { Link } from "react-router";
+/** How-it-works guide; requires Clerk sign-in. */
+import { useAuth } from "@clerk/react";
+import { Link, Navigate } from "react-router";
 
 const CARDS = [
   {
@@ -28,6 +30,20 @@ const CARDS = [
 ];
 
 export default function Onboarding() {
+  const { isLoaded, isSignedIn } = useAuth();
+
+  if (!isLoaded) {
+    return (
+      <main>
+        <p role="status">Loading…</p>
+      </main>
+    );
+  }
+
+  if (!isSignedIn) {
+    return <Navigate to="/login" replace />;
+  }
+
   return (
     <main>
       <h1>How it works</h1>

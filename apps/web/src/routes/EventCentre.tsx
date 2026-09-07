@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link, useParams } from "react-router";
+import { useAuth } from "@clerk/react";
+import { Link, Navigate, useParams } from "react-router";
 import ChallengeCard from "../components/ChallengeCard";
 import type { ChallengeStatus } from "../components/ChallengeCard";
 import Countdown from "../components/Countdown";
@@ -84,15 +85,28 @@ function isEventState(value: unknown): value is EventState {
 }
 
 export default function EventCentre() {
+  const { isLoaded, isSignedIn } = useAuth();
   const params = useParams();
   const eventId = params["eventId"] ?? "";
 
   const state = useQuery({
     queryKey: ["events", eventId, "state"],
     queryFn: () => apiGet(`/events/${eventId}/state`, isEventState),
-    enabled: eventId.length > 0,
+    enabled: eventId.length > 0 && isSignedIn === true,
     refetchInterval: 15_000
   });
+
+  if (!isLoaded) {
+    return (
+      <main>
+        <p role="status">Loading…</p>
+      </main>
+    );
+  }
+
+  if (!isSignedIn) {
+    return <Navigate to="/login" replace />;
+  }
 
   return (
     <main aria-busy={state.isPending}>

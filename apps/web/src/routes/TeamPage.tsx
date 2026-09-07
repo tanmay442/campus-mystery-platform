@@ -1,7 +1,8 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { useParams } from "react-router";
+import { useAuth } from "@clerk/react";
+import { Navigate, useParams } from "react-router";
 import { ApiError, apiGet, submitWithIdempotency } from "../lib/api";
 
 interface Member {
@@ -47,6 +48,7 @@ function isOk(value: unknown): value is { ok: boolean } {
 }
 
 export default function TeamPage() {
+  const { isLoaded, isSignedIn } = useAuth();
   const params = useParams();
   const eventId = params["eventId"] ?? "";
   const [teamName, setTeamName] = useState("");
@@ -56,8 +58,20 @@ export default function TeamPage() {
   const team = useQuery({
     queryKey: ["events", eventId, "team"],
     queryFn: () => apiGet(`/events/${eventId}/team`, isTeamSummary),
-    enabled: eventId.length > 0
+    enabled: eventId.length > 0 && isSignedIn === true
   });
+
+  if (!isLoaded) {
+    return (
+      <main>
+        <p role="status">Loading…</p>
+      </main>
+    );
+  }
+
+  if (!isSignedIn) {
+    return <Navigate to="/login" replace />;
+  }
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

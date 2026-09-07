@@ -1,5 +1,7 @@
+/** Session account state plus the Clerk-to-cookie session exchange. */
 import { useQuery } from "@tanstack/react-query";
-import { apiGet } from "./api";
+import type { QueryClient } from "@tanstack/react-query";
+import { ApiError, apiGet, apiPost } from "./api";
 
 export interface SessionUser {
   id: string;
@@ -37,4 +39,18 @@ export function useSession() {
 export function useAdminFlag(): boolean {
   const session = useSession();
   return session.data?.isAdmin === true;
+}
+
+export type GetClerkToken = () => Promise<string | null>;
+
+export async function exchangeClerkSession(
+  getToken: GetClerkToken,
+  queryClient: QueryClient
+): Promise<void> {
+  const token = await getToken();
+  if (token === null) {
+    throw new ApiError({ code: "UNAUTHENTICATED", message: "Sign in to continue." });
+  }
+  await apiPost("/auth/login", { provider: "clerk", token }, isRecord);
+  await queryClient.invalidateQueries({ queryKey: ["me"] });
 }

@@ -25,13 +25,24 @@ export const presenceVisibilitySchema = z.enum([
 
 export type PresenceVisibility = z.infer<typeof presenceVisibilitySchema>;
 
-export const loginBodySchema = z.object({
-  providerToken: z.string().min(1).max(2048),
+const loginOptionalFields = {
   username: usernameSchema.optional(),
   displayName: displayNameSchema.optional(),
   deviceLabel: deviceLabelSchema.optional(),
   turnstileToken: z.string().min(1).max(2048).optional(),
-});
+};
+
+export const loginBodySchema = z.union([
+  z.object({
+    providerToken: z.string().min(1).max(2048),
+    ...loginOptionalFields,
+  }),
+  z.object({
+    provider: z.enum(["dev", "clerk"]),
+    token: z.string().min(1).max(2048),
+    ...loginOptionalFields,
+  }),
+]);
 
 export type LoginBody = z.infer<typeof loginBodySchema>;
 
