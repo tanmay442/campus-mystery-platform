@@ -297,12 +297,12 @@ export async function listChallengesByEvent(
   db: DatabaseBinding,
   eventId: string
 ): Promise<ChallengeRow[]> {
-  const raw = await db
+  const raw = (await db
     .prepare(
       "/*Q:challenges_by_event*/ SELECT id, event_id, title, description, position, configuration_json FROM challenges WHERE event_id = ? ORDER BY position ASC"
     )
     .bind(eventId)
-    .all();
+    .all()).results;
   const rows: ChallengeRow[] = [];
   for (const entry of raw) {
     const row = parseRow(challengeRowSchema, entry);
@@ -331,12 +331,12 @@ export async function listActiveMembers(
   db: DatabaseBinding,
   participantId: string
 ): Promise<MemberRow[]> {
-  const raw = await db
+  const raw = (await db
     .prepare(
       "/*Q:members_active*/ SELECT participant_id, user_id FROM participant_members WHERE participant_id = ? AND left_at IS NULL"
     )
     .bind(participantId)
-    .all();
+    .all()).results;
   const rows: MemberRow[] = [];
   for (const entry of raw) {
     const row = parseRow(memberRowSchema, entry);
@@ -363,12 +363,12 @@ export async function getProgressRows(
   participantId: string,
   challengeId: string
 ): Promise<ProgressRow[]> {
-  const raw = await db
+  const raw = (await db
     .prepare(
       "/*Q:progress_rows*/ SELECT id, participant_id, challenge_id, objective_key, status, completed_by, completed_at, data_json, idempotency_key FROM objective_progress WHERE participant_id = ? AND challenge_id = ?"
     )
     .bind(participantId, challengeId)
-    .all();
+    .all()).results;
   const rows: ProgressRow[] = [];
   for (const entry of raw) {
     const row = parseRow(progressRowSchema, entry);
@@ -411,12 +411,12 @@ export async function listCompletedProgressForParticipant(
   db: DatabaseBinding,
   participantId: string
 ): Promise<ProgressRow[]> {
-  const raw = await db
+  const raw = (await db
     .prepare(
       "/*Q:progress_completed_participant*/ SELECT id, participant_id, challenge_id, objective_key, status, completed_by, completed_at, data_json, idempotency_key FROM objective_progress WHERE participant_id = ? AND status = 'completed'"
     )
     .bind(participantId)
-    .all();
+    .all()).results;
   const rows: ProgressRow[] = [];
   for (const entry of raw) {
     const row = parseRow(progressRowSchema, entry);

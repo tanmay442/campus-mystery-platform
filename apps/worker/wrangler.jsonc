@@ -13,15 +13,13 @@
     // via the Cloudflare dashboard / secrets, never committed to the repo.
     "ADMIN_EMAILS": ""
   },
-  // database_id below is a local-only placeholder so `wrangler dev` and
-  // `--local` migrations run without Cloudflare credentials. Real IDs are
-  // written here when staging/production are provisioned (Phase 0) via
-  // `wrangler d1 create`. Never invent IDs for remote use.
+  // All database_id values are real Cloudflare IDs. `--local` commands
+  // still run against local state; `--remote` touches the named database.
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "campus-mystery-dev",
-      "database_id": "00000000-0000-0000-0000-000000000000",
+      "database_id": "81b957f5-5c0e-49c3-9932-43d8e0f1325d",
       "migrations_dir": "../../packages/db/migrations"
     }
   ],
@@ -41,7 +39,7 @@
         {
           "binding": "DB",
           "database_name": "campus-mystery-staging",
-          "database_id": "00000000-0000-0000-0000-000000000000",
+          "database_id": "a72a95ca-a5c0-49f7-b257-af17e05c5df6",
           "migrations_dir": "../../packages/db/migrations"
         }
       ],
@@ -61,7 +59,7 @@
         {
           "binding": "DB",
           "database_name": "campus-mystery-production",
-          "database_id": "00000000-0000-0000-0000-000000000000",
+          "database_id": "438ad759-3620-403b-9c91-788e966b377a",
           "migrations_dir": "../../packages/db/migrations"
         }
       ],

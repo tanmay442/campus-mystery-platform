@@ -141,12 +141,12 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
   if (event === undefined) {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
   }
-  const participantRaw = await db
+  const participantRaw = (await db
     .prepare(
       "/*Q:participants_by_event*/ SELECT id, event_id, type, name, event_points, penalty_seconds, completed_at FROM participants WHERE event_id = ? ORDER BY created_at ASC"
     )
     .bind(event.id)
-    .all();
+    .all()).results;
   const participantParsed = participantListSchema.safeParse(participantRaw);
   if (participantParsed.success === false) {
     return errorResponse(c, "INTERNAL", "Could not load the leaderboard");
@@ -176,12 +176,12 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
       }
     }
   }
-  const progressRaw = await db
+  const progressRaw = (await db
     .prepare(
       "/*Q:progress_completed_event*/ SELECT op.participant_id AS participant_id, op.challenge_id AS challenge_id, op.objective_key AS objective_key, op.completed_at AS completed_at FROM objective_progress op JOIN challenges ch ON ch.id = op.challenge_id WHERE ch.event_id = ? AND op.status = 'completed'"
     )
     .bind(event.id)
-    .all();
+    .all()).results;
   const progressParsed = completedProgressListSchema.safeParse(progressRaw);
   const completedByParticipant = new Map<string, ProgressRow[]>();
   if (progressParsed.success) {

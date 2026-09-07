@@ -321,7 +321,10 @@ function createFakeDb(seed: SeedInput = {}): {
             const firstRow = rows[0];
             return Promise.resolve(firstRow === undefined ? null : firstRow);
           },
-          all: () => Promise.resolve(handleAll(tables, sql, values)),
+          all: () =>
+            Promise.resolve({
+              results: handleAll(tables, sql, values)
+            }),
           run: () => Promise.resolve(handleRun(tables, sql, values))
         };
         seen.set(statement, { sql, values });

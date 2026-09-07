@@ -30,8 +30,10 @@ class FakeStatement implements PreparedStatementBinding {
     return this.db.handleFirst(this.query, this.params);
   }
 
-  all(): Promise<Row[]> {
-    return this.db.handleAll(this.query, this.params);
+  all(): Promise<{ results: Array<Row> }> {
+    return this.db.handleAll(this.query, this.params).then((results) => ({
+      results
+    }));
   }
 
   run(): Promise<unknown> {

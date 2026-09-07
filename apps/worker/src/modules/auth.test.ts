@@ -32,8 +32,10 @@ class FakeStatement implements PreparedStatementBinding {
     return this.db.handleFirst(this.query, this.params);
   }
 
-  all(): Promise<Array<Row>> {
-    return this.db.handleAll(this.query, this.params);
+  all(): Promise<{ results: Array<Row> }> {
+    return this.db.handleAll(this.query, this.params).then((results) => ({
+      results
+    }));
   }
 
   run(): Promise<unknown> {
@@ -826,8 +828,11 @@ describe("clerk session JWT login", () => {
   it("rejects a clerk session with a tampered signature", async () => {
     const harness = await createClerkHarness("https://clerk-test.dev");
     const token = await harness.sign({ subject: "user_tampered" });
-    const last = token.slice(-1);
-    const tampered = `${token.slice(0, -1)}${last === "a" ? "b" : "a"}`;
+    const parts = token.split(".");
+    const signature = parts[2] ?? "";
+    const first = signature.slice(0, 1);
+    const tamperedSignature = `${first === "A" ? "B" : "A"}${signature.slice(1)}`;
+    const tampered = `${parts[0]}.${parts[1]}.${tamperedSignature}`;
     const res = await clerkLoginRequest(harness, {
       provider: "clerk",
       token: tampered,

@@ -155,12 +155,12 @@ async function findActiveParticipant(
   eventId: string,
   userId: string
 ): Promise<ParticipantRow | null> {
-  const raw: unknown = await db
+  const raw: unknown = (await db
     .prepare(
       "SELECT id, participant_id, user_id, role, joined_at, left_at FROM participant_members WHERE user_id = ?"
     )
     .bind(userId)
-    .all();
+    .all()).results;
   const members = z.array(memberRowSchema).parse(raw);
   for (const member of members) {
     if (member.left_at !== null) {
@@ -179,12 +179,12 @@ async function hasApprovedInvite(
   eventId: string,
   userId: string
 ): Promise<boolean> {
-  const raw: unknown = await db
+  const raw: unknown = (await db
     .prepare(
       "SELECT participant_id FROM team_invites WHERE requested_user_id = ? AND status = ?"
     )
     .bind(userId, "approved")
-    .all();
+    .all()).results;
   const invites = z.array(approvedInviteRowSchema).parse(raw);
   for (const invite of invites) {
     const participant = await getParticipant(db, invite.participant_id);
@@ -221,11 +221,11 @@ eventsRouter.get("/api/events", async (c) => {
   const statuses: readonly string[] =
     requested === undefined ? PUBLISHED_STATUSES : [requested];
   const placeholders = statuses.map(() => "?").join(", ");
-  const raw: unknown = await c.env.DB.prepare(
+  const raw: unknown = (await c.env.DB.prepare(
     `SELECT ${EVENT_COLUMNS} FROM events WHERE status IN (${placeholders}) ORDER BY starts_at ASC`
   )
     .bind(...statuses)
-    .all();
+    .all()).results;
   const rows = z.array(eventRowSchema).parse(raw);
   return c.json({ events: rows.map(publicEvent) });
 });
@@ -241,11 +241,11 @@ eventsRouter.get("/api/events/:eventId", async (c) => {
   if (event === null || isPublishedStatus(event.status) === false) {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
   }
-  const challengesRaw: unknown = await c.env.DB.prepare(
+  const challengesRaw: unknown = (await c.env.DB.prepare(
     "SELECT id FROM challenges WHERE event_id = ?"
   )
     .bind(event.id)
-    .all();
+    .all()).results;
   const challengeIds = z.array(z.object({ id: z.string() })).parse(challengesRaw);
   return c.json({
     event: { ...publicEvent(event), challengeCount: challengeIds.length }
@@ -409,23 +409,23 @@ eventsRouter.get("/api/events/:eventId/state", async (c) => {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
   }
   const participant = await findActiveParticipant(c.env.DB, event.id, user.id);
-  const challengesRaw: unknown = await c.env.DB.prepare(
+  const challengesRaw: unknown = (await c.env.DB.prepare(
     "SELECT id, event_id, title, description, position, configuration_json, created_at, updated_at FROM challenges WHERE event_id = ? ORDER BY position ASC"
   )
     .bind(event.id)
-    .all();
+    .all()).results;
   const challengeRows = z.array(challengeRowSchema).parse(challengesRaw);
-  const participantsRaw: unknown = await c.env.DB.prepare(
+  const participantsRaw: unknown = (await c.env.DB.prepare(
     "SELECT id FROM participants WHERE event_id = ?"
   )
     .bind(event.id)
-    .all();
+    .all()).results;
   const participantIds = z.array(z.object({ id: z.string() })).parse(participantsRaw);
-  const announcementsRaw: unknown = await c.env.DB.prepare(
+  const announcementsRaw: unknown = (await c.env.DB.prepare(
     "SELECT id, event_id, title, body, created_at, created_by, published_at FROM announcements WHERE event_id = ? AND published_at IS NOT NULL ORDER BY published_at DESC"
   )
     .bind(event.id)
-    .all();
+    .all()).results;
   const announcementRows = z.array(announcementRowSchema).parse(announcementsRaw);
   return c.json({
     event: publicEvent(event),

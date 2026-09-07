@@ -339,12 +339,12 @@ export async function readActiveMembers(
   db: DatabaseBinding,
   participantId: string
 ): Promise<Array<StoredMemberWithUsername>> {
-  const rows = await db
+  const rows = (await db
     .prepare(
       "SELECT m.id, m.participant_id, m.user_id, m.role, m.joined_at, m.left_at, u.username AS username FROM participant_members AS m INNER JOIN users AS u ON u.id = m.user_id WHERE m.participant_id = ? AND m.left_at IS NULL ORDER BY m.joined_at ASC"
     )
     .bind(participantId)
-    .all();
+    .all()).results;
   const members: Array<StoredMemberWithUsername> = [];
   for (const row of rows) {
     const parsed = memberWithUsernameSchema.safeParse(row);
@@ -368,12 +368,12 @@ export async function readUserEventHistory(
   userId: string,
   eventId: string
 ): Promise<Array<MembershipChange>> {
-  const rows = await db
+  const rows = (await db
     .prepare(
       "SELECT m.joined_at, m.left_at FROM participant_members AS m INNER JOIN participants AS p ON p.id = m.participant_id WHERE m.user_id = ? AND p.event_id = ?"
     )
     .bind(userId, eventId)
-    .all();
+    .all()).results;
   const changes: Array<MembershipChange> = [];
   for (const row of rows) {
     const parsed = historyRowSchema.safeParse(row);
@@ -391,12 +391,12 @@ export async function readTeamHistory(
   db: DatabaseBinding,
   participantId: string
 ): Promise<Array<MembershipChange>> {
-  const rows = await db
+  const rows = (await db
     .prepare(
       "SELECT joined_at, left_at FROM participant_members WHERE participant_id = ?"
     )
     .bind(participantId)
-    .all();
+    .all()).results;
   const changes: Array<MembershipChange> = [];
   for (const row of rows) {
     const parsed = historyRowSchema.safeParse(row);

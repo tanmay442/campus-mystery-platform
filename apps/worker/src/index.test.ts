@@ -23,7 +23,7 @@ function testEnv(): Env {
   const statement: PreparedStatementBinding = {
     bind: (..._values: Array<unknown>) => statement,
     first: () => Promise.resolve(null),
-    all: () => Promise.resolve([]),
+    all: () => Promise.resolve({ results: [] }),
     run: () => Promise.resolve({ success: true })
   };
   const db: DatabaseBinding = {

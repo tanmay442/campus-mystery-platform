@@ -1,7 +1,7 @@
 export interface PreparedStatementBinding {
   bind(...values: Array<unknown>): PreparedStatementBinding;
   first(): Promise<Record<string, unknown> | null>;
-  all(): Promise<Array<Record<string, unknown>>>;
+  all(): Promise<{ results: Array<Record<string, unknown>> }>;
   run(): Promise<unknown>;
 }
 

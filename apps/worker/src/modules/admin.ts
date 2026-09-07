@@ -211,12 +211,12 @@ async function listChallenges(
   db: DatabaseBinding,
   eventId: string
 ): Promise<ChallengeRow[]> {
-  const raw: unknown = await db
+  const raw: unknown = (await db
     .prepare(
       "SELECT id, event_id, title, description, position, configuration_json, created_at, updated_at FROM challenges WHERE event_id = ? ORDER BY position ASC"
     )
     .bind(eventId)
-    .all();
+    .all()).results;
   return z.array(challengeRowSchema).parse(raw);
 }
 
@@ -767,7 +767,7 @@ adminRouter.get("/api/admin/audit", async (c) => {
     values.length === 0
       ? c.env.DB.prepare(sql)
       : c.env.DB.prepare(sql).bind(...values);
-  const raw: unknown = await stmt.all();
+  const raw: unknown = (await stmt.all()).results;
   const rows = z.array(auditRowSchema).parse(raw);
   const last = rows[rows.length - 1];
   return c.json({

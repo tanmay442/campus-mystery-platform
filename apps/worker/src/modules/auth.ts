@@ -500,12 +500,12 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
         .bind(identity.email, identity.emailVerified ? 1 : 0, now, userId);
     }
 
-    const sessionsRaw: unknown = await db
+    const sessionsRaw: unknown = (await db
       .prepare(
         "SELECT id, device_label, created_at, expires_at FROM sessions WHERE user_id = ? AND revoked_at IS NULL ORDER BY created_at ASC, rowid ASC",
       )
       .bind(userId)
-      .all();
+      .all()).results;
     const sessionsParsed = z.array(sessionBriefSchema).safeParse(sessionsRaw);
     if (sessionsParsed.success === false) {
       return errorResponse(c, "INTERNAL", "Unable to load sessions");

@@ -36,12 +36,12 @@ async function loadHistory(c: AppContext, limit: number): Promise<Response> {
   if (row === undefined) {
     return errorResponse(c, "NOT_FOUND", "User not found");
   }
-  const raw = await db
+  const raw = (await db
     .prepare(
       "/*Q:credit_txs_by_user*/ SELECT id, user_id, event_id, amount, reason, reference_id, created_at FROM credit_transactions WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"
     )
     .bind(user.id, limit)
-    .all();
+    .all()).results;
   const parsed = creditTxListSchema.safeParse(raw);
   const transactions: CreditTxRow[] = parsed.success ? parsed.data : [];
   return c.json({
