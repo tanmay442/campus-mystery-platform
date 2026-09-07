@@ -21,10 +21,21 @@ made to hosted state, and the rules for touching any of it. The session logs
 | R2 | `campus-mystery-media-dev` | n/a (name-addressed) | development | Created. Empty. |
 | R2 | `campus-mystery-media-staging` | n/a (name-addressed) | staging | Created. Empty. |
 | R2 | `campus-mystery-media-production` | n/a (name-addressed) | production | Created. Empty. |
-| Worker | `campus-mystery-platform-staging` | version `5abd8004-...` (session 04) | staging | Deployed. `https://campus-mystery-platform-staging.goeltanmay442.workers.dev` with `ENVIRONMENT=staging`, `ADMIN_EMAILS` passed as a deploy flag (not committed). Serves the pre-`.results`-fix build. |
+| Worker | `campus-mystery-platform-staging` | version `16652d57-...` (session 06) | staging | Deployed from `staging` branch. `https://campus-mystery-platform-staging.goeltanmay442.workers.dev` with `ENVIRONMENT=staging`, `ADMIN_EMAILS` passed as a deploy flag (not committed). Serves hardening + `.results`-fix build. |
 | Turnstile | — | — | — | Not configured anywhere. Backend runs open mode until keys exist. |
 
-## Changes made to hosted state (all in session 04)
+## Changes made to hosted state
+
+5. Manual `wrangler deploy --env staging` from the `staging` branch, version
+   `16652d57` (session 06, user-approved). Live verification: `/api/health`
+   200 staging, `/api/events` 200 `{"events":[]}` (the `.results` fix
+   confirmed live), unknown event 404 EVENT_NOT_FOUND, unauthenticated
+   admin POST 401, `/` 404 (no SPA deployed — API only).
+6. GitHub issue #1 opened: add `CLOUDFLARE_API_TOKEN` secret so the
+   push-to-staging workflow can deploy by itself (attempted minting via
+   OAuth, refused 403).
+
+Earlier (all session 04):
 
 1. `wrangler d1 create` for the three databases above.
 2. `wrangler r2 bucket create` for the three buckets above.
