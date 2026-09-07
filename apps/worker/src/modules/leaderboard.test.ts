@@ -599,4 +599,50 @@ describe("leaderboard route", () => {
       expect.unreachable();
     }
   });
+
+  it("ignores progression unlock metadata when ranking", async () => {
+    const seed = await seedWorld("live");
+    const now = new Date().toISOString();
+    seed.db.table("challenges").push({
+      id: "ch2",
+      event_id: "ev1",
+      title: "Sealed",
+      description: "Later",
+      position: 2,
+      configuration_json: JSON.stringify({
+        objectives: [
+          {
+            key: "o1",
+            type: "text_answer",
+            prompt: "Sealed prompt",
+            required: false,
+            dependsOn: [],
+            expectedAnswer: "sealed",
+            eventPoints: 0,
+            platformCredits: 0,
+            hints: []
+          }
+        ],
+        requires: ["ch1"],
+        availableFrom: "2026-09-01T00:00:00.000Z",
+        hiddenUntilUnlocked: true,
+        requiresDecision: { challengeId: "ch1", objectiveKey: "route", value: "left" },
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
+    });
+    const res = await app.request(
+      "/api/events/ev1/leaderboard",
+      { headers: { Cookie: `cmp_session=${seed.tokenCaller}` } },
+      testEnv(seed.db)
+    );
+    expect(res.status).toBe(200);
+    const parsed = boardSchema.safeParse(await res.json());
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.entries[0]?.participantId).toBe("f2");
+      expect(parsed.data.caller?.participantId).toBe("c1");
+    }
+  });
 });

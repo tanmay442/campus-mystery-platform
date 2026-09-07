@@ -104,8 +104,28 @@ export const objectiveConfigSchema = z.object({
 
 export type ObjectiveConfig = z.infer<typeof objectiveConfigSchema>;
 
+export const requiresDecisionSchema = z.object({
+  challengeId: z.string().min(1),
+  objectiveKey: z.string().min(1),
+  value: z.string().min(1)
+});
+
+export type RequiresDecision = z.infer<typeof requiresDecisionSchema>;
+
+export const challengeDateSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((value) => Number.isNaN(Date.parse(value)) === false, "Invalid date");
+
 export const challengeConfigurationSchema = z.object({
-  objectives: z.array(objectiveConfigSchema).min(1)
+  objectives: z.array(objectiveConfigSchema).min(1),
+  requires: z.array(z.string().min(1)).default([]),
+  availableFrom: challengeDateSchema.optional(),
+  availableUntil: challengeDateSchema.optional(),
+  hiddenUntilUnlocked: z.boolean().default(false),
+  isTerminal: z.boolean().default(false),
+  requiresDecision: requiresDecisionSchema.optional()
 }).catchall(z.unknown());
 
 export type ChallengeConfiguration = z.infer<typeof challengeConfigurationSchema>;
@@ -279,6 +299,59 @@ export function haversineMeters(
     + Math.cos(toRadians(fromLatitude)) * Math.cos(toRadians(toLatitude))
     * Math.sin(deltaLon / 2) * Math.sin(deltaLon / 2);
   return 2 * earthRadiusMeters * Math.asin(Math.min(1, Math.sqrt(halfChord)));
+}
+
+export type DecisionChoiceMap = Record<string, Record<string, string>>;
+
+export function isChallengeComplete(
+  config: ChallengeConfiguration,
+  completedObjectiveKeys: readonly string[]
+): boolean {
+  const required = config.objectives.filter((objective) => objective.required);
+  if (required.length > 0) {
+    return required.every((objective) => completedObjectiveKeys.includes(objective.key));
+  }
+  if (config.objectives.length === 0) {
+    return false;
+  }
+  return config.objectives.some((objective) => completedObjectiveKeys.includes(objective.key));
+}
+
+export function isChallengeUnlocked(
+  config: ChallengeConfiguration,
+  completedChallengeIds: readonly string[],
+  decisionChoices: Readonly<Record<string, Readonly<Record<string, string>>>>,
+  nowIsoValue: string
+): boolean {
+  for (const prerequisite of config.requires) {
+    if (completedChallengeIds.includes(prerequisite) === false) {
+      return false;
+    }
+  }
+  if (config.requiresDecision !== undefined) {
+    const recorded =
+      decisionChoices[config.requiresDecision.challengeId]?.[config.requiresDecision.objectiveKey];
+    if (recorded !== config.requiresDecision.value) {
+      return false;
+    }
+  }
+  const nowMs = Date.parse(nowIsoValue);
+  if (Number.isNaN(nowMs)) {
+    return false;
+  }
+  if (config.availableFrom !== undefined) {
+    const fromMs = Date.parse(config.availableFrom);
+    if (Number.isNaN(fromMs) || nowMs < fromMs) {
+      return false;
+    }
+  }
+  if (config.availableUntil !== undefined) {
+    const untilMs = Date.parse(config.availableUntil);
+    if (Number.isNaN(untilMs) || nowMs > untilMs) {
+      return false;
+    }
+  }
+  return true;
 }
 
 export function bandForDistance(

@@ -3,6 +3,8 @@
 import { Hono } from "hono";
 import {
   challengeConfigurationSchema,
+  isChallengeComplete,
+  isChallengeUnlocked,
   submitAnswerBodySchema,
   validateAnswer
 } from "@campus/shared";
@@ -31,7 +33,6 @@ export const PHASE1_COMPLETABLE_OBJECTIVE_TYPES: ObjectiveType[] = [
 ];
 
 export const PHASE1_MANUAL_OBJECTIVE_TYPES: ObjectiveType[] = [
-  "decision",
   "timer",
   "manual_approval",
   "media"
@@ -136,7 +137,8 @@ const progressDataSchema = z
     lastAttemptAt: z.string().optional(),
     hintsUnlocked: z.array(z.string()).default([]),
     distanceMeters: z.number().optional(),
-    accuracyMeters: z.number().optional()
+    accuracyMeters: z.number().optional(),
+    decisionChoice: z.string().min(1).optional()
   })
   .catchall(z.unknown());
 
@@ -425,6 +427,59 @@ export async function listCompletedProgressForParticipant(
     }
   }
   return rows;
+}
+
+export interface ProgressionSnapshot {
+  completedChallengeIds: string[];
+  decisionChoices: Record<string, Record<string, string>>;
+  now: string;
+}
+
+export async function loadProgressionSnapshot(
+  db: DatabaseBinding,
+  participantId: string,
+  challenges: ChallengeRow[]
+): Promise<ProgressionSnapshot> {
+  const now = nowIso();
+  const completed = await listCompletedProgressForParticipant(db, participantId);
+  const keysByChallenge = new Map<string, string[]>();
+  for (const row of completed) {
+    const list = keysByChallenge.get(row.challenge_id) ?? [];
+    list.push(row.objective_key);
+    keysByChallenge.set(row.challenge_id, list);
+  }
+  const completedChallengeIds: string[] = [];
+  const decisionChoices: Record<string, Record<string, string>> = {};
+  for (const challenge of challenges) {
+    const config = parseConfiguration(challenge.configuration_json);
+    if (config === undefined) {
+      continue;
+    }
+    const keys = keysByChallenge.get(challenge.id) ?? [];
+    if (isChallengeComplete(config, keys)) {
+      completedChallengeIds.push(challenge.id);
+    }
+    for (const objective of config.objectives) {
+      if (objective.type !== "decision") {
+        continue;
+      }
+      const row = completed.find(
+        (entry) =>
+          entry.challenge_id === challenge.id && entry.objective_key === objective.key
+      );
+      if (row === undefined) {
+        continue;
+      }
+      const choice = readProgressData(row.data_json).decisionChoice;
+      if (choice === undefined || choice.length === 0) {
+        continue;
+      }
+      const scoped = decisionChoices[challenge.id] ?? {};
+      scoped[objective.key] = choice;
+      decisionChoices[challenge.id] = scoped;
+    }
+  }
+  return { completedChallengeIds, decisionChoices, now };
 }
 
 export function eventGateStatus(status: string): ErrorCode | null {
@@ -893,6 +948,100 @@ export function buildValidationInput(
   }
 }
 
+interface DecisionSubmitInput {
+  db: DatabaseBinding;
+  eventId: string;
+  participant: ParticipantRow;
+  challengeId: string;
+  userId: string;
+  objective: ObjectiveConfig;
+  answer: unknown;
+  bodyKey: string | undefined;
+}
+
+async function submitDecision(c: AppContext, input: DecisionSubmitInput): Promise<Response> {
+  const rows = await getProgressRows(input.db, input.participant.id, input.challengeId);
+  const rowsByKey = new Map(rows.map((row) => [row.objective_key, row]));
+  const status = deriveObjectiveStatus(input.objective.key, input.objective.dependsOn, rowsByKey);
+  if (status === "locked") {
+    return errorResponse(c, "OBJECTIVE_LOCKED", "This objective is not available yet");
+  }
+  const existing = rowsByKey.get(input.objective.key);
+  if (existing !== undefined && existing.status === "completed") {
+    const replayed: CompletionResult = {
+      objectiveKey: input.objective.key,
+      completedAt: existing.completed_at ?? nowIso(),
+      completedBy: existing.completed_by ?? input.userId,
+      eventPointsAward: input.objective.eventPoints,
+      platformCreditsAward: input.objective.platformCredits,
+      replayed: true
+    };
+    return c.json({ completed: true, ...replayed, idempotentReplay: true });
+  }
+  if (typeof input.answer !== "string" || input.answer.trim().length === 0) {
+    return errorResponse(c, "VALIDATION_ERROR", "A choice is required");
+  }
+  const choice = input.answer.trim();
+  if (
+    input.objective.choices !== undefined &&
+    input.objective.choices.length > 0 &&
+    input.objective.choices.some((entry) => entry.id === choice) === false
+  ) {
+    return errorResponse(c, "VALIDATION_ERROR", "Unknown choice");
+  }
+  const headerKey = c.get("idempotencyKey");
+  const idempotencyKey =
+    headerKey !== undefined && headerKey.length > 0
+      ? headerKey.slice(0, MAX_IDEMPOTENCY_KEY_LENGTH)
+      : input.bodyKey;
+  if (idempotencyKey !== undefined) {
+    const keyed = await getProgressByIdempotencyKey(input.db, idempotencyKey);
+    if (keyed !== undefined) {
+      const matches =
+        keyed.participant_id === input.participant.id &&
+        keyed.challenge_id === input.challengeId &&
+        keyed.objective_key === input.objective.key &&
+        keyed.status === "completed";
+      if (matches) {
+        return c.json({
+          completed: true,
+          objectiveKey: input.objective.key,
+          completedAt: keyed.completed_at ?? nowIso(),
+          completedBy: keyed.completed_by ?? input.userId,
+          eventPointsAward: input.objective.eventPoints,
+          platformCreditsAward: input.objective.platformCredits,
+          replayed: true,
+          idempotentReplay: true
+        });
+      }
+      return errorResponse(c, "DUPLICATE_SUBMISSION", "Idempotency key already used");
+    }
+  }
+  const data: ProgressData = {
+    ...readProgressData(existing?.data_json ?? null),
+    decisionChoice: choice
+  };
+  const outcome = await completeObjective({
+    db: input.db,
+    eventId: input.eventId,
+    participant: input.participant,
+    challengeId: input.challengeId,
+    objectiveKey: input.objective.key,
+    userId: input.userId,
+    idempotencyKey,
+    eventPointsAward: input.objective.eventPoints,
+    platformCreditsAward: input.objective.platformCredits,
+    progressData: data
+  });
+  if (outcome.kind === "duplicate_key") {
+    return errorResponse(c, "DUPLICATE_SUBMISSION", "Idempotency key already used");
+  }
+  if (outcome.kind === "error") {
+    return errorResponse(c, "INTERNAL", "Could not record the completion");
+  }
+  return c.json({ completed: true, ...outcome.result, idempotentReplay: outcome.result.replayed });
+}
+
 const challengeIdParams = z.object({
   challengeId: z.string().min(1)
 });
@@ -936,6 +1085,32 @@ challengesRouter.get("/api/challenges/:challengeId", async (c) => {
   const config = parseConfiguration(challenge.configuration_json);
   if (config === undefined) {
     return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+  }
+  const eventChallenges = await listChallengesByEvent(db, event.id);
+  const snapshot = await loadProgressionSnapshot(db, participant.id, eventChallenges);
+  if (
+    isChallengeUnlocked(config, snapshot.completedChallengeIds, snapshot.decisionChoices, snapshot.now) === false
+  ) {
+    if (config.hiddenUntilUnlocked) {
+      return errorResponse(c, "NOT_FOUND", "Challenge not found");
+    }
+    return c.json({
+      challenge: {
+        id: challenge.id,
+        eventId: challenge.event_id,
+        title: challenge.title,
+        description: null,
+        position: challenge.position
+      },
+      participant: { id: participant.id, eventPoints: participant.event_points },
+      locked: true,
+      objectives: config.objectives.map((objective) => ({
+        key: objective.key,
+        status: "locked",
+        required: objective.required
+      })),
+      completed: false
+    });
   }
   const rows = await getProgressRows(db, participant.id, challenge.id);
   const rowsByKey = new Map(rows.map((row) => [row.objective_key, row]));
@@ -1011,6 +1186,16 @@ challengesRouter.post(
     if (objective === undefined) {
       return errorResponse(c, "NOT_FOUND", "Objective not found");
     }
+    const submitChallenges = await listChallengesByEvent(db, event.id);
+    const submitSnapshot = await loadProgressionSnapshot(db, participant.id, submitChallenges);
+    if (
+      isChallengeUnlocked(config, submitSnapshot.completedChallengeIds, submitSnapshot.decisionChoices, submitSnapshot.now) === false
+    ) {
+      if (config.hiddenUntilUnlocked) {
+        return errorResponse(c, "NOT_FOUND", "Challenge not found");
+      }
+      return errorResponse(c, "OBJECTIVE_LOCKED", "This challenge is not unlocked yet");
+    }
     if (objective.type === "location") {
       return errorResponse(
         c,
@@ -1018,6 +1203,18 @@ challengesRouter.post(
         "Location objectives are verified through the verify-location endpoint",
         { status: 501 }
       );
+    }
+    if (objective.type === "decision") {
+      return submitDecision(c, {
+        db,
+        eventId: event.id,
+        participant,
+        challengeId: challenge.id,
+        userId: user.id,
+        objective,
+        answer: body.data.answer,
+        bodyKey: body.data.idempotencyKey
+      });
     }
     if (PHASE1_MANUAL_OBJECTIVE_TYPES.includes(objective.type)) {
       return errorResponse(
@@ -1169,6 +1366,16 @@ challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", asyn
   if (config === undefined) {
     return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
   }
+  const hintChallenges = await listChallengesByEvent(db, event.id);
+  const hintSnapshot = await loadProgressionSnapshot(db, participant.id, hintChallenges);
+  if (
+    isChallengeUnlocked(config, hintSnapshot.completedChallengeIds, hintSnapshot.decisionChoices, hintSnapshot.now) === false
+  ) {
+    if (config.hiddenUntilUnlocked) {
+      return errorResponse(c, "NOT_FOUND", "Challenge not found");
+    }
+    return errorResponse(c, "OBJECTIVE_LOCKED", "This challenge is not unlocked yet");
+  }
   let hint:
     | { key: string; text: string; costPoints: number; objectiveKey: string }
     | undefined;
@@ -1186,6 +1393,14 @@ challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", asyn
   }
   if (hint === undefined) {
     return errorResponse(c, "NOT_FOUND", "Hint not found");
+  }
+  const hintTarget = config.objectives.find((entry) => entry.key === hint.objectiveKey);
+  if (hintTarget !== undefined) {
+    const hintRows = await getProgressRows(db, participant.id, challenge.id);
+    const hintByKey = new Map(hintRows.map((row) => [row.objective_key, row]));
+    if (deriveObjectiveStatus(hintTarget.key, hintTarget.dependsOn, hintByKey) === "locked") {
+      return errorResponse(c, "OBJECTIVE_LOCKED", "This objective is not available yet");
+    }
   }
   const existing = await getProgressOne(db, participant.id, challenge.id, hint.objectiveKey);
   const data = readProgressData(existing?.data_json ?? null);

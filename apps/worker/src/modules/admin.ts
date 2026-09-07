@@ -3,12 +3,14 @@ import { Hono } from "hono";
 import { z } from "zod";
 import {
   canTransition,
+  challengeConfigurationSchema,
   createEventSchema,
   eventSettingsSchema,
   eventStatusSchema,
-  updateEventSchema
+  updateEventSchema,
+  validateRouteGraph
 } from "@campus/shared";
-import type { EventStatus } from "@campus/shared";
+import type { EventStatus, RouteGraphNode } from "@campus/shared";
 import type { AppEnv, DatabaseBinding, PreparedStatementBinding } from "../env";
 import { errorResponse, notImplemented } from "../lib/errors";
 import type { AppContext } from "../lib/errors";
@@ -94,12 +96,51 @@ const auditRowSchema = z.object({
 const EVENT_COLUMNS =
   "id, name, slug, description, status, starts_at, ends_at, settings_json, created_by, created_at, updated_at";
 
+export interface PublishChallengeInput {
+  id: string;
+  configurationJson: string;
+}
+
+function routeNodeForPublish(id: string, configurationJson: string): RouteGraphNode {
+  const fallback: RouteGraphNode = {
+    id,
+    requires: [],
+    requiresDecision: undefined,
+    isTerminal: false,
+    decisionOptions: []
+  };
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(configurationJson);
+  } catch {
+    return fallback;
+  }
+  const parsed = challengeConfigurationSchema.safeParse(decoded);
+  if (parsed.success === false) {
+    return fallback;
+  }
+  const config = parsed.data;
+  return {
+    id,
+    requires: [...config.requires],
+    requiresDecision: config.requiresDecision,
+    isTerminal: config.isTerminal,
+    decisionOptions: config.objectives
+      .filter((objective) => objective.type === "decision")
+      .map((objective) => ({
+        objectiveKey: objective.key,
+        values: (objective.choices ?? []).map((choice) => choice.id)
+      }))
+  };
+}
+
 export function validateEventForPublish(input: {
   settingsJson: string;
   startsAt: string | null;
   endsAt: string | null;
   challengeCount: number;
-}): { ok: boolean; error?: string } {
+  challenges?: readonly PublishChallengeInput[] | undefined;
+}): { ok: boolean; error?: string; reasons?: string[] } {
   let settings: unknown;
   try {
     settings = JSON.parse(input.settingsJson);
@@ -127,6 +168,25 @@ export function validateEventForPublish(input: {
   }
   if (input.challengeCount < 1) {
     return { ok: false, error: "Event needs at least one challenge" };
+  }
+  if (input.challenges !== undefined) {
+    const nodes = input.challenges.map((challenge) =>
+      routeNodeForPublish(challenge.id, challenge.configurationJson)
+    );
+    let reasons = validateRouteGraph(nodes);
+    if (input.challenges.length === 1) {
+      const only = nodes[0];
+      if (
+        only !== undefined &&
+        only.requires.length === 0 &&
+        only.requiresDecision === undefined
+      ) {
+        reasons = reasons.filter((reason) => reason !== "missing_final_target");
+      }
+    }
+    if (reasons.length > 0) {
+      return { ok: false, error: "Event route is invalid", reasons };
+    }
   }
   return { ok: true };
 }
@@ -478,9 +538,18 @@ adminRouter.post("/api/admin/events/:eventId/publish", async (c) => {
     settingsJson: event.settings_json,
     startsAt: event.starts_at,
     endsAt: event.ends_at,
-    challengeCount: challenges.length
+    challengeCount: challenges.length,
+    challenges: challenges.map((challenge) => ({
+      id: challenge.id,
+      configurationJson: challenge.configuration_json
+    }))
   });
   if (validation.ok === false) {
+    if (validation.reasons !== undefined && validation.reasons.length > 0) {
+      return errorResponse(c, "CONFLICT", validation.error ?? "Event route is invalid", {
+        details: { reasons: validation.reasons }
+      });
+    }
     return errorResponse(c, "VALIDATION_ERROR", validation.error ?? "Event is not ready");
   }
   const now = nowIso();

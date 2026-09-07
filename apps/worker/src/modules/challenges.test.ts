@@ -438,6 +438,16 @@ function challengeConfig(): string {
         hints: []
       },
       {
+        key: "wait1",
+        type: "timer",
+        prompt: "Wait for the bell",
+        required: false,
+        dependsOn: [],
+        eventPoints: 0,
+        platformCredits: 0,
+        hints: []
+      },
+      {
         key: "loc1",
         type: "location",
         prompt: "Find the old gate",
@@ -967,10 +977,23 @@ describe("answer submission", () => {
 
   it("returns 501 for Phase 1 unsupported objective types", async () => {
     const seed = await seedWorld("live");
+    const res = await postJson(seed.db, "/api/challenges/ch1/objectives/wait1/submit", seed.tokenU1, {
+      answer: "anything"
+    });
+    expect(res.status).toBe(501);
+  });
+
+  it("records decision choices through the submit endpoint", async () => {
+    const seed = await seedWorld("live");
     const res = await postJson(seed.db, "/api/challenges/ch1/objectives/d1/submit", seed.tokenU1, {
       answer: "left"
     });
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(200);
+    const stored = seed.db
+      .table("objective_progress")
+      .find((row) => row["challenge_id"] === "ch1" && row["objective_key"] === "d1");
+    expect(stored?.["status"]).toBe("completed");
+    expect(String(stored?.["data_json"] ?? "")).toContain("left");
   });
 });
 
@@ -999,6 +1022,335 @@ describe("hint unlocks", () => {
     if (secondBody.success) {
       expect(secondBody.data.alreadyUnlocked).toBe(true);
       expect(secondBody.data.eventPoints).toBe(7);
+    } else {
+      expect.unreachable();
+    }
+  });
+});
+
+function progTextObjective(key: string, answer: string, hints: unknown[] = []): Record<string, unknown> {
+  return {
+    key,
+    type: "text_answer",
+    prompt: `Prompt for ${key}`,
+    required: true,
+    dependsOn: [],
+    expectedAnswer: answer,
+    eventPoints: 5,
+    platformCredits: 0,
+    hints
+  };
+}
+
+function progConfig(objectives: unknown[], extra: Record<string, unknown> = {}): string {
+  return JSON.stringify({ objectives, ...extra });
+}
+
+interface ProgSeed extends Seed {
+  now: string;
+}
+
+async function seedProgression(): Promise<ProgSeed> {
+  const base = await seedWorld("live");
+  const now = new Date().toISOString();
+  base.db.table("challenges").push(
+    {
+      id: "chA",
+      event_id: "ev1",
+      title: "Alpha",
+      description: "First",
+      position: 2,
+      configuration_json: progConfig([progTextObjective("a1", "alpha")]),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chB",
+      event_id: "ev1",
+      title: "Beta",
+      description: "Second",
+      position: 3,
+      configuration_json: progConfig(
+        [
+          {
+            ...progTextObjective("b1", "beta"),
+            hints: [{ key: "bh1", text: "Beta hint", costPoints: 1 }]
+          }
+        ],
+        { requires: ["chA"], isTerminal: true }
+      ),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chC",
+      event_id: "ev1",
+      title: "Gamma",
+      description: "Secret",
+      position: 4,
+      configuration_json: progConfig([progTextObjective("c1", "gamma")], {
+        requires: ["chB"],
+        hiddenUntilUnlocked: true,
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chD",
+      event_id: "ev1",
+      title: "Branch",
+      description: "Choose",
+      position: 5,
+      configuration_json: progConfig([
+        {
+          key: "route",
+          type: "decision",
+          prompt: "Choose a route",
+          required: false,
+          dependsOn: [],
+          choices: [
+            { id: "left", label: "Left path" },
+            { id: "right", label: "Right path" }
+          ],
+          eventPoints: 0,
+          platformCredits: 0,
+          hints: []
+        }
+      ]),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chL",
+      event_id: "ev1",
+      title: "Left",
+      description: "Left route",
+      position: 6,
+      configuration_json: progConfig([progTextObjective("l1", "left")], {
+        requiresDecision: { challengeId: "chD", objectiveKey: "route", value: "left" },
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chR",
+      event_id: "ev1",
+      title: "Right",
+      description: "Right route",
+      position: 7,
+      configuration_json: progConfig([progTextObjective("r1", "right")], {
+        requiresDecision: { challengeId: "chD", objectiveKey: "route", value: "right" },
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "chS",
+      event_id: "ev1",
+      title: "Scheduled",
+      description: "Later",
+      position: 8,
+      configuration_json: progConfig([progTextObjective("s1", "later")], {
+        availableFrom: "2999-01-01T00:00:00.000Z"
+      }),
+      created_at: now,
+      updated_at: now
+    }
+  );
+  return { ...base, now };
+}
+
+const lockedFetchSchema = z
+  .object({
+    challenge: z.object({ id: z.string(), title: z.string() }).catchall(z.unknown()),
+    participant: z.object({ id: z.string() }).catchall(z.unknown()),
+    locked: z.literal(true),
+    objectives: z.array(
+      z
+        .object({ key: z.string(), status: z.string(), required: z.boolean() })
+        .catchall(z.unknown())
+    ),
+    completed: z.boolean()
+  })
+  .catchall(z.unknown());
+
+async function fetchChallenge(db: DatabaseBinding, path: string, token: string): Promise<Response> {
+  return app.request(path, { headers: { Cookie: cookieFor(token) } }, testEnv(db));
+}
+
+describe("challenge unlocking", () => {
+  it("returns locked shells without prompts for visible-but-locked challenges", async () => {
+    const seed = await seedProgression();
+    const res = await fetchChallenge(seed.db, "/api/challenges/chB", seed.tokenU1);
+    expect(res.status).toBe(200);
+    const body: unknown = await res.json();
+    const parsed = lockedFetchSchema.safeParse(body);
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.challenge.id).toBe("chB");
+      expect(parsed.data.objectives).toEqual([{ key: "b1", status: "locked", required: true }]);
+      expect(parsed.data.completed).toBe(false);
+    }
+    const raw = JSON.stringify(body);
+    expect(raw).not.toContain("Prompt for b1");
+    expect(raw).not.toContain("beta");
+    expect(raw).not.toContain("Beta hint");
+  });
+
+  it("omits hidden-locked challenges from fetch", async () => {
+    const seed = await seedProgression();
+    const res = await fetchChallenge(seed.db, "/api/challenges/chC", seed.tokenU1);
+    expect(res.status).toBe(404);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("NOT_FOUND");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("rejects submissions to locked challenges", async () => {
+    const seed = await seedProgression();
+    const res = await postJson(seed.db, "/api/challenges/chB/objectives/b1/submit", seed.tokenU1, {
+      answer: "beta"
+    });
+    expect(res.status).toBe(403);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("OBJECTIVE_LOCKED");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("rejects hint unlocks on locked challenges", async () => {
+    const seed = await seedProgression();
+    const res = await postJson(seed.db, "/api/challenges/chB/hints/bh1/unlock", seed.tokenU1, {});
+    expect(res.status).toBe(403);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("OBJECTIVE_LOCKED");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("locks scheduled challenges until their window opens", async () => {
+    const seed = await seedProgression();
+    const fetched = await fetchChallenge(seed.db, "/api/challenges/chS", seed.tokenU1);
+    expect(fetched.status).toBe(200);
+    const parsed = lockedFetchSchema.safeParse(await fetched.json());
+    expect(parsed.success).toBe(true);
+    const submitted = await postJson(
+      seed.db,
+      "/api/challenges/chS/objectives/s1/submit",
+      seed.tokenU1,
+      { answer: "later" }
+    );
+    expect(submitted.status).toBe(403);
+    const errorParsed = errorSchema.safeParse(await submitted.json());
+    if (errorParsed.success) {
+      expect(errorParsed.data.code).toBe("OBJECTIVE_LOCKED");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("unlocks a sequential chain including hidden challenges after completions", async () => {
+    const seed = await seedProgression();
+    const first = await postJson(seed.db, "/api/challenges/chA/objectives/a1/submit", seed.tokenU1, {
+      answer: "alpha"
+    });
+    expect(first.status).toBe(200);
+    const betaFetch = await fetchChallenge(seed.db, "/api/challenges/chB", seed.tokenU1);
+    expect(betaFetch.status).toBe(200);
+    const betaBody: unknown = await betaFetch.json();
+    expect(lockedFetchSchema.safeParse(betaBody).success).toBe(false);
+    expect(JSON.stringify(betaBody)).toContain("Prompt for b1");
+    const second = await postJson(seed.db, "/api/challenges/chB/objectives/b1/submit", seed.tokenU1, {
+      answer: "beta"
+    });
+    expect(second.status).toBe(200);
+    const gammaFetch = await fetchChallenge(seed.db, "/api/challenges/chC", seed.tokenU1);
+    expect(gammaFetch.status).toBe(200);
+    expect(JSON.stringify(await gammaFetch.json())).toContain("Prompt for c1");
+    const third = await postJson(seed.db, "/api/challenges/chC/objectives/c1/submit", seed.tokenU1, {
+      answer: "gamma"
+    });
+    expect(third.status).toBe(200);
+  });
+
+  it("records decision choices and unlocks exactly one branch", async () => {
+    const seed = await seedProgression();
+    const before = await fetchChallenge(seed.db, "/api/challenges/chL", seed.tokenU1);
+    expect(before.status).toBe(200);
+    expect(lockedFetchSchema.safeParse(await before.json()).success).toBe(true);
+    const decision = await postJson(
+      seed.db,
+      "/api/challenges/chD/objectives/route/submit",
+      seed.tokenU1,
+      { answer: "left" }
+    );
+    expect(decision.status).toBe(200);
+    const decisionParsed = submitSuccessSchema.safeParse(await decision.json());
+    expect(decisionParsed.success).toBe(true);
+    const leftFetch = await fetchChallenge(seed.db, "/api/challenges/chL", seed.tokenU1);
+    expect(leftFetch.status).toBe(200);
+    expect(JSON.stringify(await leftFetch.json())).toContain("Prompt for l1");
+    const rightFetch = await fetchChallenge(seed.db, "/api/challenges/chR", seed.tokenU1);
+    expect(rightFetch.status).toBe(200);
+    expect(lockedFetchSchema.safeParse(await rightFetch.json()).success).toBe(true);
+    const blocked = await postJson(
+      seed.db,
+      "/api/challenges/chR/objectives/r1/submit",
+      seed.tokenU1,
+      { answer: "right" }
+    );
+    expect(blocked.status).toBe(403);
+    const stored = seed.db
+      .table("objective_progress")
+      .find((row) => row["challenge_id"] === "chD" && row["objective_key"] === "route");
+    expect(String(stored?.["data_json"] ?? "")).toContain("left");
+  });
+
+  it("replays a completed decision without switching branches", async () => {
+    const seed = await seedProgression();
+    const first = await postJson(
+      seed.db,
+      "/api/challenges/chD/objectives/route/submit",
+      seed.tokenU1,
+      { answer: "left" }
+    );
+    expect(first.status).toBe(200);
+    const second = await postJson(
+      seed.db,
+      "/api/challenges/chD/objectives/route/submit",
+      seed.tokenU1,
+      { answer: "right" }
+    );
+    expect(second.status).toBe(200);
+    const parsed = submitSuccessSchema.safeParse(await second.json());
+    if (parsed.success) {
+      expect(parsed.data.replayed).toBe(true);
+    } else {
+      expect.unreachable();
+    }
+    const rightFetch = await fetchChallenge(seed.db, "/api/challenges/chR", seed.tokenU1);
+    expect(lockedFetchSchema.safeParse(await rightFetch.json()).success).toBe(true);
+  });
+
+  it("rejects unknown decision values", async () => {
+    const seed = await seedProgression();
+    const res = await postJson(seed.db, "/api/challenges/chD/objectives/route/submit", seed.tokenU1, {
+      answer: "up"
+    });
+    expect(res.status).toBe(400);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("VALIDATION_ERROR");
     } else {
       expect.unreachable();
     }

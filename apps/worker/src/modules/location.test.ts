@@ -533,6 +533,77 @@ async function seedWorld(status: string): Promise<Seed> {
       configuration_json: revealedChallengeConfig(),
       created_at: now,
       updated_at: now
+    },
+    {
+      id: "ch3",
+      event_id: "ev1",
+      title: "Vault",
+      description: "Sealed",
+      position: 3,
+      configuration_json: JSON.stringify({
+        objectives: [
+          {
+            key: "loc9",
+            type: "location",
+            prompt: "Find the sealed vault",
+            required: true,
+            dependsOn: [],
+            location: {
+              latitude: TARGET_LATITUDE,
+              longitude: TARGET_LONGITUDE,
+              radiusMeters: 10,
+              maximumAccuracyMeters: 20,
+              requiredReadings: 3,
+              collectionDurationSeconds: 8,
+              readingsExpireAfterSeconds: 60
+            },
+            revealCoordinates: false,
+            eventPoints: 4,
+            platformCredits: 0,
+            hints: []
+          }
+        ],
+        requires: ["ch1"],
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
+    },
+    {
+      id: "ch4",
+      event_id: "ev1",
+      title: "Buried",
+      description: "Hidden",
+      position: 4,
+      configuration_json: JSON.stringify({
+        objectives: [
+          {
+            key: "locH",
+            type: "location",
+            prompt: "Find the buried cache",
+            required: true,
+            dependsOn: [],
+            location: {
+              latitude: TARGET_LATITUDE,
+              longitude: TARGET_LONGITUDE,
+              radiusMeters: 10,
+              maximumAccuracyMeters: 20,
+              requiredReadings: 3,
+              collectionDurationSeconds: 8,
+              readingsExpireAfterSeconds: 60
+            },
+            revealCoordinates: false,
+            eventPoints: 4,
+            platformCredits: 0,
+            hints: []
+          }
+        ],
+        requires: ["ch1"],
+        hiddenUntilUnlocked: true,
+        isTerminal: true
+      }),
+      created_at: now,
+      updated_at: now
     }
   );
   const tokenU1 = "token-u1";
@@ -1027,5 +1098,47 @@ describe("verify location", () => {
     } else {
       expect.unreachable();
     }
+  });
+
+  it("blocks verification on challenge-locked challenges", async () => {
+    const seed = await seedWorld("live");
+    const res = await postJson(
+      seed.db,
+      "/api/challenges/ch3/objectives/loc9/verify-location",
+      seed.tokenU1,
+      { readings: nearReadings() }
+    );
+    expect(res.status).toBe(403);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("OBJECTIVE_LOCKED");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("blocks location sessions on challenge-locked challenges", async () => {
+    const seed = await seedWorld("live");
+    const res = await postJson(seed.db, "/api/challenges/ch3/objectives/loc9/location-session", seed.tokenU1, {});
+    expect(res.status).toBe(403);
+    const parsed = errorSchema.safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("OBJECTIVE_LOCKED");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("omits hidden-locked challenges from location endpoints", async () => {
+    const seed = await seedWorld("live");
+    const verified = await postJson(
+      seed.db,
+      "/api/challenges/ch4/objectives/locH/verify-location",
+      seed.tokenU1,
+      { readings: nearReadings() }
+    );
+    expect(verified.status).toBe(404);
+    const session = await postJson(seed.db, "/api/challenges/ch4/objectives/locH/location-session", seed.tokenU1, {});
+    expect(session.status).toBe(404);
   });
 });

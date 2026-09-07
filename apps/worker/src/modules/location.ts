@@ -1,7 +1,7 @@
 /** Phase 1 location sessions and server-side geofence verification. */
 
 import { Hono } from "hono";
-import { haversineMeters, verifyLocationBodySchema } from "@campus/shared";
+import { haversineMeters, isChallengeUnlocked, verifyLocationBodySchema } from "@campus/shared";
 import type { LocationReading } from "@campus/shared";
 import { z } from "zod";
 import type { AppEnv } from "../env";
@@ -12,8 +12,10 @@ import {
   getActiveParticipant,
   getProgressByIdempotencyKey,
   getProgressRows,
+  listChallengesByEvent,
   loadChallengeById,
   loadEventById,
+  loadProgressionSnapshot,
   parseConfiguration,
   readProgressData,
   resolveRequestUser
@@ -148,6 +150,16 @@ locationRouter.post(
     if (config === undefined) {
       return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
     }
+    const eventChallenges = await listChallengesByEvent(db, event.id);
+    const snapshot = await loadProgressionSnapshot(db, participant.id, eventChallenges);
+    if (
+      isChallengeUnlocked(config, snapshot.completedChallengeIds, snapshot.decisionChoices, snapshot.now) === false
+    ) {
+      if (config.hiddenUntilUnlocked) {
+        return errorResponse(c, "NOT_FOUND", "Challenge not found");
+      }
+      return errorResponse(c, "OBJECTIVE_LOCKED", "This challenge is not unlocked yet");
+    }
     const objective = config.objectives.find((entry) => entry.key === params.data.objectiveKey);
     if (objective === undefined) {
       return errorResponse(c, "NOT_FOUND", "Objective not found");
@@ -240,6 +252,16 @@ locationRouter.post(
     const config = parseConfiguration(challenge.configuration_json);
     if (config === undefined) {
       return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+    }
+    const eventChallenges = await listChallengesByEvent(db, event.id);
+    const snapshot = await loadProgressionSnapshot(db, participant.id, eventChallenges);
+    if (
+      isChallengeUnlocked(config, snapshot.completedChallengeIds, snapshot.decisionChoices, snapshot.now) === false
+    ) {
+      if (config.hiddenUntilUnlocked) {
+        return errorResponse(c, "NOT_FOUND", "Challenge not found");
+      }
+      return errorResponse(c, "OBJECTIVE_LOCKED", "This challenge is not unlocked yet");
     }
     const objective = config.objectives.find((entry) => entry.key === params.data.objectiveKey);
     if (objective === undefined) {

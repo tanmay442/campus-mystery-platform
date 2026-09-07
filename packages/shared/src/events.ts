@@ -172,3 +172,127 @@ export const updateEventSchema = z.object({
 });
 
 export type UpdateEventInput = z.infer<typeof updateEventSchema>;
+
+export interface RouteGraphDecisionOption {
+  objectiveKey: string;
+  values: string[];
+}
+
+export interface RouteGraphNode {
+  id: string;
+  requires: string[];
+  requiresDecision?: { challengeId: string; objectiveKey: string; value: string } | undefined;
+  isTerminal: boolean;
+  decisionOptions: RouteGraphDecisionOption[];
+}
+
+export function validateRouteGraph(nodes: readonly RouteGraphNode[]): string[] {
+  const reasons: string[] = [];
+  const known = new Set(nodes.map((node) => node.id));
+  for (const node of nodes) {
+    for (const prerequisite of node.requires) {
+      if (known.has(prerequisite) === false) {
+        reasons.push(`missing_prerequisite:${node.id}:${prerequisite}`);
+      }
+    }
+    if (
+      node.requiresDecision !== undefined &&
+      known.has(node.requiresDecision.challengeId) === false
+    ) {
+      reasons.push(`missing_prerequisite:${node.id}:${node.requiresDecision.challengeId}`);
+    }
+  }
+  const edgesOf = (node: RouteGraphNode): string[] => {
+    const edges = node.requires.filter((prerequisite) => known.has(prerequisite));
+    if (
+      node.requiresDecision !== undefined &&
+      known.has(node.requiresDecision.challengeId)
+    ) {
+      edges.push(node.requiresDecision.challengeId);
+    }
+    return edges;
+  };
+  const visited = new Set<string>();
+  const trail: string[] = [];
+  const inTrail = new Set<string>();
+  const visit = (id: string): void => {
+    if (inTrail.has(id)) {
+      const start = trail.indexOf(id);
+      reasons.push(`dependency_cycle:${[...trail.slice(start), id].join("->")}`);
+      return;
+    }
+    if (visited.has(id)) {
+      return;
+    }
+    visited.add(id);
+    trail.push(id);
+    inTrail.add(id);
+    const node = nodes.find((entry) => entry.id === id);
+    if (node !== undefined) {
+      for (const edge of edgesOf(node)) {
+        visit(edge);
+      }
+    }
+    trail.pop();
+    inTrail.delete(id);
+  };
+  for (const node of nodes) {
+    visit(node.id);
+  }
+  const reachable = new Set<string>();
+  for (const node of nodes) {
+    if (node.requires.length === 0 && node.requiresDecision === undefined) {
+      reachable.add(node.id);
+    }
+  }
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (const node of nodes) {
+      if (reachable.has(node.id)) {
+        continue;
+      }
+      const depsReady = node.requires.every(
+        (prerequisite) => reachable.has(prerequisite) || known.has(prerequisite) === false
+      );
+      const decisionReady =
+        node.requiresDecision === undefined ||
+        reachable.has(node.requiresDecision.challengeId) ||
+        known.has(node.requiresDecision.challengeId) === false;
+      if (depsReady && decisionReady) {
+        reachable.add(node.id);
+        grew = true;
+      }
+    }
+  }
+  for (const node of nodes) {
+    if (reachable.has(node.id) === false) {
+      reasons.push(`unreachable:${node.id}`);
+    }
+  }
+  for (const node of nodes) {
+    if (reachable.has(node.id) === false) {
+      continue;
+    }
+    for (const option of node.decisionOptions) {
+      for (const value of option.values) {
+        const unlocks = nodes.some(
+          (entry) =>
+            reachable.has(entry.id) &&
+            entry.requiresDecision !== undefined &&
+            entry.requiresDecision.challengeId === node.id &&
+            entry.requiresDecision.objectiveKey === option.objectiveKey &&
+            entry.requiresDecision.value === value
+        );
+        if (unlocks === false) {
+          reasons.push(`branch_without_path:${node.id}:${option.objectiveKey}:${value}`);
+        }
+      }
+    }
+  }
+  const terminalReachable = nodes.some((node) => node.isTerminal && reachable.has(node.id));
+  if (terminalReachable === false) {
+    reasons.push("missing_final_target");
+  }
+  return reasons;
+}
