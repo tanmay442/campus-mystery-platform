@@ -10,11 +10,21 @@ import {
   updateEventSchema,
   validateRouteGraph
 } from "@campus/shared";
-import type { EventStatus, RouteGraphNode } from "@campus/shared";
+import type {
+  ChallengeConfiguration,
+  EventStatus,
+  RouteGraphNode
+} from "@campus/shared";
 import type { AppEnv, DatabaseBinding, PreparedStatementBinding } from "../env";
-import { errorResponse, notImplemented } from "../lib/errors";
+import { errorResponse } from "../lib/errors";
 import type { AppContext } from "../lib/errors";
 import { nowIso } from "../lib/time";
+import {
+  completeObjective,
+  eventGateStatus,
+  getProgressOne,
+  readProgressData
+} from "./challenges";
 
 const eventIdParams = z.object({ eventId: z.string().min(1) });
 
@@ -34,7 +44,49 @@ const penaltyIdParams = z.object({
   penaltyId: z.string().min(1)
 });
 
-const passthroughBody = z.object({}).catchall(z.unknown());
+const createChallengeBody = z
+  .object({
+    title: z.string().min(1).max(200),
+    description: z.string().max(5000).nullable().optional(),
+    position: z.number().int().min(0).optional(),
+    configuration: challengeConfigurationSchema,
+    confirmLiveEdit: z.boolean().optional()
+  })
+  .catchall(z.unknown());
+
+const patchChallengeBody = z
+  .object({
+    title: z.string().min(1).max(200).optional(),
+    description: z.string().max(5000).nullable().optional(),
+    position: z.number().int().min(0).optional(),
+    configuration: challengeConfigurationSchema.optional(),
+    confirmLiveEdit: z.boolean().optional()
+  })
+  .catchall(z.unknown());
+
+const deleteChallengeBody = z
+  .object({ confirmLiveEdit: z.boolean().optional() })
+  .catchall(z.unknown());
+
+const manualCompletionBody = z
+  .object({
+    participantId: z.string().min(1),
+    challengeId: z.string().min(1),
+    note: z.string().max(500).optional(),
+    idempotencyKey: z.string().min(1).max(128).optional()
+  })
+  .catchall(z.unknown());
+
+const penaltyBody = z
+  .object({
+    seconds: z.number().int().min(1).max(86400),
+    reason: z.string().min(1).max(500)
+  })
+  .catchall(z.unknown());
+
+const waiveBody = z
+  .object({ note: z.string().max(500).optional() })
+  .catchall(z.unknown());
 
 const publishBody = z.object({
   to: z.enum(["scheduled", "live"]).optional()
@@ -82,6 +134,34 @@ const challengeRowSchema = z.object({
 });
 
 type ChallengeRow = z.infer<typeof challengeRowSchema>;
+
+const participantRowSchema = z
+  .object({
+    id: z.string(),
+    event_id: z.string(),
+    type: z.string(),
+    name: z.string(),
+    event_points: z.number(),
+    penalty_seconds: z.number(),
+    completed_at: z.string().nullable()
+  })
+  .catchall(z.unknown());
+
+type ParticipantRow = z.infer<typeof participantRowSchema>;
+
+const penaltyRowSchema = z.object({
+  id: z.string(),
+  participant_id: z.string(),
+  admin_user_id: z.string(),
+  seconds: z.number(),
+  reason: z.string(),
+  waived: z.number(),
+  created_at: z.string(),
+  updated_at: z.string(),
+  waived_at: z.string().nullable()
+});
+
+type PenaltyRow = z.infer<typeof penaltyRowSchema>;
 
 const auditRowSchema = z.object({
   id: z.string(),
@@ -213,6 +293,76 @@ function adminEvent(row: EventRow): Record<string, unknown> {
   };
 }
 
+function adminChallenge(row: ChallengeRow): Record<string, unknown> {
+  // Admin-only view: includes the full configuration (correct answers,
+  // unlock rules). Player endpoints always serve sanitized views instead.
+  let configuration: unknown = null;
+  try {
+    configuration = JSON.parse(row.configuration_json);
+  } catch {
+    configuration = null;
+  }
+  return {
+    id: row.id,
+    eventId: row.event_id,
+    title: row.title,
+    description: row.description,
+    position: row.position,
+    configuration,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function penaltyView(row: PenaltyRow): Record<string, unknown> {
+  return {
+    id: row.id,
+    participantId: row.participant_id,
+    adminUserId: row.admin_user_id,
+    seconds: row.seconds,
+    reason: row.reason,
+    waived: row.waived === 1,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    waivedAt: row.waived_at
+  };
+}
+
+function duplicateObjectiveKeys(config: ChallengeConfiguration): string[] {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const objective of config.objectives) {
+    if (seen.has(objective.key)) {
+      duplicates.add(objective.key);
+    }
+    seen.add(objective.key);
+  }
+  return [...duplicates];
+}
+
+/**
+ * Guard for structural edits (event PATCH, challenge CRUD). Completed and
+ * archived events are read-only; live/paused events require explicit
+ * confirmLiveEdit so progress is never silently invalidated (PRD §16.8).
+ */
+function structuralEditGuard(
+  c: AppContext,
+  status: EventStatus,
+  confirmLiveEdit: boolean
+): Response | null {
+  if (status === "completed" || status === "archived") {
+    return errorResponse(c, "CONFLICT", "Completed events are read-only");
+  }
+  if ((status === "live" || status === "paused") && confirmLiveEdit === false) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Structural changes to a live event require confirmLiveEdit"
+    );
+  }
+  return null;
+}
+
 function auditEntry(
   db: DatabaseBinding,
   now: string,
@@ -249,6 +399,54 @@ async function findEvent(
     return null;
   }
   return eventRowSchema.parse(raw);
+}
+
+async function findChallengeById(
+  db: DatabaseBinding,
+  challengeId: string
+): Promise<ChallengeRow | null> {
+  const raw: unknown = await db
+    .prepare(
+      "/*Q:admin_challenge_by_id*/ SELECT id, event_id, title, description, position, configuration_json, created_at, updated_at FROM challenges WHERE id = ? LIMIT 1"
+    )
+    .bind(challengeId)
+    .first();
+  if (raw === null) {
+    return null;
+  }
+  return challengeRowSchema.parse(raw);
+}
+
+async function findParticipantById(
+  db: DatabaseBinding,
+  participantId: string
+): Promise<ParticipantRow | null> {
+  const raw: unknown = await db
+    .prepare(
+      "/*Q:admin_participant_by_id*/ SELECT id, event_id, type, name, event_points, penalty_seconds, completed_at FROM participants WHERE id = ? LIMIT 1"
+    )
+    .bind(participantId)
+    .first();
+  if (raw === null) {
+    return null;
+  }
+  return participantRowSchema.parse(raw);
+}
+
+async function findPenaltyById(
+  db: DatabaseBinding,
+  penaltyId: string
+): Promise<PenaltyRow | null> {
+  const raw: unknown = await db
+    .prepare(
+      "/*Q:admin_penalty_by_id*/ SELECT id, participant_id, admin_user_id, seconds, reason, waived, created_at, updated_at, waived_at FROM penalties WHERE id = ? LIMIT 1"
+    )
+    .bind(penaltyId)
+    .first();
+  if (raw === null) {
+    return null;
+  }
+  return penaltyRowSchema.parse(raw);
 }
 
 async function slugTaken(
@@ -670,6 +868,10 @@ adminRouter.post("/api/admin/events/:eventId/archive", async (c) => {
 adminRouter.post(
   "/api/admin/events/:eventId/challenges",
   async (c) => {
+    const admin = c.get("user");
+    if (admin === undefined) {
+      return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
     const params = eventIdParams.safeParse({
       eventId: c.req.param("eventId")
     });
@@ -677,15 +879,69 @@ adminRouter.post(
       return errorResponse(c, "VALIDATION_ERROR", "Invalid event id");
     }
     const raw: unknown = await c.req.json().catch(() => ({}));
-    const body = passthroughBody.safeParse(raw);
+    const body = createChallengeBody.safeParse(raw);
     if (body.success === false) {
       return errorResponse(c, "VALIDATION_ERROR", "Invalid challenge payload");
     }
-    return notImplemented(c, "POST /api/admin/events/:eventId/challenges");
+    const event = await findEvent(c.env.DB, params.data.eventId);
+    if (event === null) {
+      return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    const status = parseStatus(event);
+    if (status === null) {
+      return errorResponse(c, "INTERNAL", "Event has an invalid status");
+    }
+    const guard = structuralEditGuard(c, status, body.data.confirmLiveEdit === true);
+    if (guard !== null) {
+      return guard;
+    }
+    const duplicates = duplicateObjectiveKeys(body.data.configuration);
+    if (duplicates.length > 0) {
+      return errorResponse(
+        c,
+        "VALIDATION_ERROR",
+        `Duplicate objective keys: ${duplicates.join(", ")}`
+      );
+    }
+    const existing = await listChallenges(c.env.DB, event.id);
+    const position =
+      body.data.position ??
+      existing.reduce((max, challenge) => Math.max(max, challenge.position), -1) + 1;
+    const now = nowIso();
+    const id = crypto.randomUUID();
+    const configurationJson = JSON.stringify(body.data.configuration);
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "/*Q:admin_insert_challenge*/ INSERT INTO challenges (id, event_id, title, description, position, configuration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(
+        id,
+        event.id,
+        body.data.title,
+        body.data.description ?? null,
+        position,
+        configurationJson,
+        now,
+        now
+      ),
+      auditEntry(c.env.DB, now, admin.id, "challenge.create", "challenge", id, {
+        eventId: event.id,
+        title: body.data.title,
+        position
+      })
+    ]);
+    const created = await findChallengeById(c.env.DB, id);
+    if (created === null) {
+      return errorResponse(c, "INTERNAL", "Failed to create challenge");
+    }
+    return c.json({ challenge: adminChallenge(created) }, 201);
   }
 );
 
 adminRouter.patch("/api/admin/challenges/:challengeId", async (c) => {
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
   const params = challengeIdParams.safeParse({
     challengeId: c.req.param("challengeId")
   });
@@ -693,26 +949,125 @@ adminRouter.patch("/api/admin/challenges/:challengeId", async (c) => {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid challenge id");
   }
   const raw: unknown = await c.req.json().catch(() => ({}));
-  const body = passthroughBody.safeParse(raw);
+  const body = patchChallengeBody.safeParse(raw);
   if (body.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid challenge payload");
   }
-  return notImplemented(c, "PATCH /api/admin/challenges/:challengeId");
+  const challenge = await findChallengeById(c.env.DB, params.data.challengeId);
+  if (challenge === null) {
+    return errorResponse(c, "NOT_FOUND", "Challenge not found");
+  }
+  const event = await findEvent(c.env.DB, challenge.event_id);
+  if (event === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const status = parseStatus(event);
+  if (status === null) {
+    return errorResponse(c, "INTERNAL", "Event has an invalid status");
+  }
+  const structural =
+    body.data.configuration !== undefined || body.data.position !== undefined;
+  const guard = structuralEditGuard(
+    c,
+    status,
+    structural ? body.data.confirmLiveEdit === true : true
+  );
+  if (guard !== null) {
+    return guard;
+  }
+  if (body.data.configuration !== undefined) {
+    const duplicates = duplicateObjectiveKeys(body.data.configuration);
+    if (duplicates.length > 0) {
+      return errorResponse(
+        c,
+        "VALIDATION_ERROR",
+        `Duplicate objective keys: ${duplicates.join(", ")}`
+      );
+    }
+  }
+  const title = body.data.title ?? challenge.title;
+  const description =
+    body.data.description === undefined ? challenge.description : body.data.description;
+  const position = body.data.position ?? challenge.position;
+  const configurationJson =
+    body.data.configuration === undefined
+      ? challenge.configuration_json
+      : JSON.stringify(body.data.configuration);
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "/*Q:admin_update_challenge*/ UPDATE challenges SET title = ?, description = ?, position = ?, configuration_json = ?, updated_at = ? WHERE id = ?"
+    ).bind(title, description, position, configurationJson, now, challenge.id),
+    auditEntry(c.env.DB, now, admin.id, "challenge.update", "challenge", challenge.id, {
+      title,
+      position,
+      structural
+    })
+  ]);
+  const updated = await findChallengeById(c.env.DB, challenge.id);
+  if (updated === null) {
+    return errorResponse(c, "INTERNAL", "Failed to update challenge");
+  }
+  return c.json({ challenge: adminChallenge(updated) });
 });
 
-adminRouter.delete("/api/admin/challenges/:challengeId", (c) => {
+adminRouter.delete("/api/admin/challenges/:challengeId", async (c) => {
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
   const parsed = challengeIdParams.safeParse({
     challengeId: c.req.param("challengeId")
   });
   if (parsed.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid challenge id");
   }
-  return notImplemented(c, "DELETE /api/admin/challenges/:challengeId");
+  const raw: unknown = await c.req.json().catch(() => ({}));
+  const body = deleteChallengeBody.safeParse(raw ?? {});
+  if (body.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid payload");
+  }
+  const challenge = await findChallengeById(c.env.DB, parsed.data.challengeId);
+  if (challenge === null) {
+    return errorResponse(c, "NOT_FOUND", "Challenge not found");
+  }
+  const event = await findEvent(c.env.DB, challenge.event_id);
+  if (event === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const status = parseStatus(event);
+  if (status === null) {
+    return errorResponse(c, "INTERNAL", "Event has an invalid status");
+  }
+  const guard = structuralEditGuard(c, status, body.data.confirmLiveEdit === true);
+  if (guard !== null) {
+    return guard;
+  }
+  const now = nowIso();
+  // The challenge row is removed but existing participant progress rows are
+  // preserved (PRD §24.8): deleting content must not silently erase earned
+  // completions, and publish validation will flag dangling prerequisites.
+  await c.env.DB.batch([
+    c.env.DB.prepare("/*Q:admin_delete_challenge*/ DELETE FROM challenges WHERE id = ?").bind(
+      challenge.id
+    ),
+    auditEntry(c.env.DB, now, admin.id, "challenge.delete", "challenge", challenge.id, {
+      eventId: event.id,
+      title: challenge.title
+    })
+  ]);
+  return c.json({ deleted: true, challengeId: challenge.id });
 });
 
 adminRouter.post(
   "/api/admin/objectives/:objectiveId/manual-completion",
   async (c) => {
+    const admin = c.get("user");
+    if (admin === undefined) {
+      return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
+    // Objectives have no independent ids in the data model: :objectiveId is
+    // the objective key within the challenge given in the body.
     const params = objectiveIdParams.safeParse({
       objectiveId: c.req.param("objectiveId")
     });
@@ -720,20 +1075,135 @@ adminRouter.post(
       return errorResponse(c, "VALIDATION_ERROR", "Invalid objective id");
     }
     const raw: unknown = await c.req.json().catch(() => ({}));
-    const body = passthroughBody.safeParse(raw);
+    const body = manualCompletionBody.safeParse(raw);
     if (body.success === false) {
       return errorResponse(c, "VALIDATION_ERROR", "Invalid completion payload");
     }
-    return notImplemented(
-      c,
-      "POST /api/admin/objectives/:objectiveId/manual-completion"
+    const participant = await findParticipantById(c.env.DB, body.data.participantId);
+    if (participant === null) {
+      return errorResponse(c, "NOT_FOUND", "Participant not found");
+    }
+    const challenge = await findChallengeById(c.env.DB, body.data.challengeId);
+    if (challenge === null) {
+      return errorResponse(c, "NOT_FOUND", "Challenge not found");
+    }
+    if (participant.event_id !== challenge.event_id) {
+      return errorResponse(
+        c,
+        "VALIDATION_ERROR",
+        "Participant and challenge belong to different events"
+      );
+    }
+    const event = await findEvent(c.env.DB, challenge.event_id);
+    if (event === null) {
+      return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    // Manual completion is a live-operations override (accessibility,
+    // location fallback, organiser support). It follows the same event gate
+    // as player submissions: live only.
+    const gate = eventGateStatus(event.status);
+    if (gate !== null) {
+      const message =
+        gate === "EVENT_PAUSED"
+          ? "The event is paused. Manual completion is blocked until it resumes."
+          : "Manual completion is only available while the event is live.";
+      return errorResponse(c, gate, message);
+    }
+    let configuration: unknown;
+    try {
+      configuration = JSON.parse(challenge.configuration_json);
+    } catch {
+      return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+    }
+    const parsedConfig = challengeConfigurationSchema.safeParse(configuration);
+    if (parsedConfig.success === false) {
+      return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+    }
+    const objective = parsedConfig.data.objectives.find(
+      (entry) => entry.key === params.data.objectiveId
     );
+    if (objective === undefined) {
+      return errorResponse(c, "NOT_FOUND", "Objective not found");
+    }
+    if (objective.type === "decision") {
+      return errorResponse(
+        c,
+        "VALIDATION_ERROR",
+        "Decision objectives cannot be manually completed; the participant must choose a route"
+      );
+    }
+    const headerKey = c.get("idempotencyKey");
+    const idempotencyKey =
+      headerKey !== undefined && headerKey.length > 0
+        ? headerKey.slice(0, 128)
+        : body.data.idempotencyKey;
+    const existing = await getProgressOne(
+      c.env.DB,
+      participant.id,
+      challenge.id,
+      objective.key
+    );
+    const baseData =
+      existing?.data_json === undefined || existing.data_json === null
+        ? readProgressData(null)
+        : readProgressData(existing.data_json);
+    const outcome = await completeObjective({
+      db: c.env.DB,
+      eventId: event.id,
+      participant,
+      challengeId: challenge.id,
+      objectiveKey: objective.key,
+      userId: admin.id,
+      idempotencyKey,
+      eventPointsAward: objective.eventPoints,
+      platformCreditsAward: objective.platformCredits,
+      progressData: {
+        ...baseData,
+        manualCompletion: true,
+        manualBy: admin.id,
+        ...(body.data.note === undefined ? {} : { manualNote: body.data.note })
+      }
+    });
+    if (outcome.kind === "duplicate_key") {
+      return errorResponse(c, "CONFLICT", "Idempotency key already used");
+    }
+    if (outcome.kind === "error") {
+      return errorResponse(c, "INTERNAL", "Failed to record manual completion");
+    }
+    const now = nowIso();
+    await c.env.DB.batch([
+      auditEntry(
+        c.env.DB,
+        now,
+        admin.id,
+        "objective.manual_completion",
+        "objective_progress",
+        `${challenge.id}:${objective.key}`,
+        {
+          participantId: participant.id,
+          challengeId: challenge.id,
+          objectiveKey: objective.key,
+          note: body.data.note ?? null,
+          replayed: outcome.result.replayed
+        }
+      )
+    ]);
+    return c.json({
+      completed: true,
+      manualCompletion: true,
+      ...outcome.result,
+      idempotentReplay: outcome.result.replayed
+    });
   }
 );
 
 adminRouter.post(
   "/api/admin/participants/:participantId/penalties",
   async (c) => {
+    const admin = c.get("user");
+    if (admin === undefined) {
+      return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
     const params = participantIdParams.safeParse({
       participantId: c.req.param("participantId")
     });
@@ -741,25 +1211,118 @@ adminRouter.post(
       return errorResponse(c, "VALIDATION_ERROR", "Invalid participant id");
     }
     const raw: unknown = await c.req.json().catch(() => ({}));
-    const body = passthroughBody.safeParse(raw);
+    const body = penaltyBody.safeParse(raw);
     if (body.success === false) {
       return errorResponse(c, "VALIDATION_ERROR", "Invalid penalty payload");
     }
-    return notImplemented(
-      c,
-      "POST /api/admin/participants/:participantId/penalties"
+    const participant = await findParticipantById(c.env.DB, params.data.participantId);
+    if (participant === null) {
+      return errorResponse(c, "NOT_FOUND", "Participant not found");
+    }
+    const event = await findEvent(c.env.DB, participant.event_id);
+    if (event === null) {
+      return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    if (event.status === "archived") {
+      return errorResponse(c, "CONFLICT", "Archived events are read-only");
+    }
+    const now = nowIso();
+    const id = crypto.randomUUID();
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        "/*Q:admin_insert_penalty*/ INSERT INTO penalties (id, participant_id, admin_user_id, seconds, reason, waived, created_at, updated_at, waived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      ).bind(
+        id,
+        participant.id,
+        admin.id,
+        body.data.seconds,
+        body.data.reason,
+        0,
+        now,
+        now,
+        null
+      ),
+      c.env.DB.prepare(
+        "/*Q:add_participant_penalty*/ UPDATE participants SET penalty_seconds = penalty_seconds + ?, updated_at = ? WHERE id = ?"
+      ).bind(body.data.seconds, now, participant.id),
+      auditEntry(c.env.DB, now, admin.id, "penalty.apply", "penalty", id, {
+        participantId: participant.id,
+        seconds: body.data.seconds,
+        reason: body.data.reason
+      })
+    ]);
+    const penalty = await findPenaltyById(c.env.DB, id);
+    const updated = await findParticipantById(c.env.DB, participant.id);
+    if (penalty === null || updated === null) {
+      return errorResponse(c, "INTERNAL", "Failed to record penalty");
+    }
+    return c.json(
+      {
+        penalty: penaltyView(penalty),
+        participant: { id: updated.id, penaltySeconds: updated.penalty_seconds }
+      },
+      201
     );
   }
 );
 
-adminRouter.post("/api/admin/penalties/:penaltyId/waive", (c) => {
+adminRouter.post("/api/admin/penalties/:penaltyId/waive", async (c) => {
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
   const parsed = penaltyIdParams.safeParse({
     penaltyId: c.req.param("penaltyId")
   });
   if (parsed.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid penalty id");
   }
-  return notImplemented(c, "POST /api/admin/penalties/:penaltyId/waive");
+  const raw: unknown = await c.req.json().catch(() => ({}));
+  const body = waiveBody.safeParse(raw ?? {});
+  if (body.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid payload");
+  }
+  const penalty = await findPenaltyById(c.env.DB, parsed.data.penaltyId);
+  if (penalty === null) {
+    return errorResponse(c, "NOT_FOUND", "Penalty not found");
+  }
+  if (penalty.waived === 1) {
+    return errorResponse(c, "CONFLICT", "Penalty already waived");
+  }
+  const participant = await findParticipantById(c.env.DB, penalty.participant_id);
+  if (participant === null) {
+    return errorResponse(c, "NOT_FOUND", "Participant not found");
+  }
+  const event = await findEvent(c.env.DB, participant.event_id);
+  if (event === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  if (event.status === "archived") {
+    return errorResponse(c, "CONFLICT", "Archived events are read-only");
+  }
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "/*Q:admin_update_penalty_waived*/ UPDATE penalties SET waived = ?, waived_at = ?, updated_at = ? WHERE id = ?"
+    ).bind(1, now, now, penalty.id),
+    c.env.DB.prepare(
+      "/*Q:subtract_participant_penalty*/ UPDATE participants SET penalty_seconds = MAX(0, penalty_seconds - ?), updated_at = ? WHERE id = ?"
+    ).bind(penalty.seconds, now, participant.id),
+    auditEntry(c.env.DB, now, admin.id, "penalty.waive", "penalty", penalty.id, {
+      participantId: participant.id,
+      seconds: penalty.seconds,
+      note: body.data.note ?? null
+    })
+  ]);
+  const updated = await findPenaltyById(c.env.DB, penalty.id);
+  const updatedParticipant = await findParticipantById(c.env.DB, participant.id);
+  if (updated === null || updatedParticipant === null) {
+    return errorResponse(c, "INTERNAL", "Failed to waive penalty");
+  }
+  return c.json({
+    penalty: penaltyView(updated),
+    participant: { id: updatedParticipant.id, penaltySeconds: updatedParticipant.penalty_seconds }
+  });
 });
 
 adminRouter.post(

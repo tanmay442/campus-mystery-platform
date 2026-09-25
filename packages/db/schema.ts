@@ -162,6 +162,35 @@ export const creditTransactions = sqliteTable("credit_transactions", {
   createdAt: text("created_at").notNull(),
 });
 
+export const penalties = sqliteTable(
+  "penalties",
+  {
+    id: text("id").primaryKey(),
+    participantId: text("participant_id")
+      .notNull()
+      .references(() => participants.id),
+    adminUserId: text("admin_user_id")
+      .notNull()
+      .references(() => users.id),
+    seconds: integer("seconds").notNull(),
+    reason: text("reason").notNull(),
+    waived: integer("waived").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    waivedAt: text("waived_at"),
+  },
+  (table) => [
+    check(
+      "penalties_seconds_check",
+      sql`${table.seconds} > 0`,
+    ),
+    check(
+      "penalties_waived_check",
+      sql`${table.waived} IN (0, 1)`,
+    ),
+  ],
+);
+
 export const auditLog = sqliteTable("audit_log", {
   id: text("id").primaryKey(),
   adminUserId: text("admin_user_id")

@@ -12,6 +12,7 @@ const expectedTables: Array<[SQLiteTable, string]> = [
   [schema.challenges, "challenges"],
   [schema.objectiveProgress, "objective_progress"],
   [schema.creditTransactions, "credit_transactions"],
+  [schema.penalties, "penalties"],
   [schema.auditLog, "audit_log"],
   [schema.sessions, "sessions"],
   [schema.announcements, "announcements"],
@@ -19,7 +20,7 @@ const expectedTables: Array<[SQLiteTable, string]> = [
 
 describe("schema", () => {
   it("exports every expected table", () => {
-    expect(expectedTables).toHaveLength(11);
+    expect(expectedTables).toHaveLength(12);
     for (const [table, name] of expectedTables) {
       expect(table).toBeDefined();
       expect(getTableName(table)).toBe(name);
