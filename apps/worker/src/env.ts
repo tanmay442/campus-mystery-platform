@@ -47,10 +47,18 @@ export interface Env {
   CLERK_JWKS_URL?: string;
 }
 
+export interface ServiceTokenIdentity {
+  id: string;
+  name: string;
+  scopes: string[];
+  ownerId: string;
+}
+
 export interface AppVariables {
   user?: AuthUser;
   sessionToken?: string;
   idempotencyKey?: string;
+  serviceToken?: ServiceTokenIdentity;
 }
 
 export interface AppEnv {

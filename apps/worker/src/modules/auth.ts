@@ -10,6 +10,7 @@ import { errorResponse } from "../lib/errors";
 import type { AppContext } from "../lib/errors";
 import { nowIso } from "../lib/time";
 import { turnstileRequired, verifyTurnstile } from "../lib/turnstile";
+import { allowlistMatches } from "../middleware/requireAdmin";
 
 const SESSION_COOKIE = "cmp_session";
 
@@ -107,6 +108,9 @@ interface Profile {
   displayName: string | null;
   platformCredits: number;
   presenceVisibility: "visible" | "count_only" | "hidden";
+  // Server-computed from the ADMIN_EMAILS allowlist: the client may gate UI
+  // on it but must never trust it — every /api/admin/* call re-checks.
+  isAdmin: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -275,9 +279,11 @@ export interface AuthRouterDeps {
 
 function providerErrorResponse(c: AppContext, err: unknown): Response {
   if (err instanceof ProviderNotConfiguredError) {
+    // A token no configured provider can verify is a bad request shape, not
+    // a server failure (stable machine-readable codes, §19.6).
     return errorResponse(
       c,
-      "INTERNAL",
+      "VALIDATION_ERROR",
       "Authentication provider is not configured",
     );
   }
@@ -297,7 +303,7 @@ function providerErrorResponse(c: AppContext, err: unknown): Response {
   return errorResponse(c, "INTERNAL", "Authentication failed");
 }
 
-function toProfile(row: UserRow): Profile | undefined {
+function toProfile(row: UserRow, adminEmails: string): Profile | undefined {
   const visibility = presenceVisibilitySchema.safeParse(
     row.presence_visibility,
   );
@@ -312,12 +318,13 @@ function toProfile(row: UserRow): Profile | undefined {
     displayName: row.display_name,
     platformCredits: row.platform_credits,
     presenceVisibility: visibility.data,
+    isAdmin: allowlistMatches(row.email.toLowerCase(), adminEmails),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-function clientIp(c: AppContext): string | undefined {
+export function clientIp(c: AppContext): string | undefined {
   const direct = c.req.header("cf-connecting-ip")?.trim();
   if (direct !== undefined && direct.length > 0) {
     return direct;
@@ -359,7 +366,7 @@ async function loadUserById(
   if (parsed.success === false) {
     return { error: errorResponse(c, "INTERNAL", "Unable to load account") };
   }
-  const profile = toProfile(parsed.data);
+    const profile = toProfile(parsed.data, c.env.ADMIN_EMAILS ?? "");
   if (profile === undefined) {
     return { error: errorResponse(c, "INTERNAL", "Unable to load account") };
   }
@@ -463,6 +470,7 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
         displayName: body.displayName ?? null,
         platformCredits: 0,
         presenceVisibility: "visible",
+        isAdmin: allowlistMatches(identity.email.toLowerCase(), c.env.ADMIN_EMAILS ?? ""),
         createdAt: now,
         updatedAt: now,
       };
@@ -489,7 +497,7 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
         email: identity.email,
         email_verified: identity.emailVerified ? 1 : 0,
         updated_at: now,
-      });
+      }, c.env.ADMIN_EMAILS ?? "");
       if (profile === undefined) {
         return errorResponse(c, "INTERNAL", "Unable to load account");
       }
@@ -561,7 +569,9 @@ export function createAuthRouter(deps?: AuthRouterDeps): Hono<AppEnv> {
 
     setCookie(c, SESSION_COOKIE, token, {
       httpOnly: true,
-      secure: true,
+      // Secure everywhere except local development, where plain-http
+      // preview must still receive the cookie.
+      secure: c.env.ENVIRONMENT !== "development",
       sameSite: "Lax",
       path: "/",
       maxAge: SESSION_TTL_SECONDS,

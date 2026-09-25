@@ -22,6 +22,8 @@ import { newId, sha256Hex } from "../lib/crypto";
 import type { AppContext } from "../lib/errors";
 import { errorResponse } from "../lib/errors";
 import { nowIso } from "../lib/time";
+import { turnstileRequired, verifyTurnstile } from "../lib/turnstile";
+import { clientIp } from "./auth";
 
 export const PHASE1_COMPLETABLE_OBJECTIVE_TYPES: ObjectiveType[] = [
   "text_answer",
@@ -40,6 +42,7 @@ export const PHASE1_MANUAL_OBJECTIVE_TYPES: ObjectiveType[] = [
 
 const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 const MAX_COOLDOWN_SECONDS = 3600;
+const WRONG_ATTEMPTS_TURNSTILE_THRESHOLD = 3;
 
 const userRowSchema = z
   .object({
@@ -495,6 +498,33 @@ export function eventGateStatus(status: string): ErrorCode | null {
   return "EVENT_NOT_LIVE";
 }
 
+/**
+ * Gate for roster mutations (registration, team create/invite/request/
+ * approve/reject/leave/transfer). Pause freezes progress, not the roster:
+ * teams may still form while scheduled, live or paused. Draft/testing are
+ * invisible and completed/archived are closed.
+ */
+export function rosterGateStatus(status: string): ErrorCode | null {
+  if (status === "scheduled" || status === "live" || status === "paused") {
+    return null;
+  }
+  if (status === "completed" || status === "archived") {
+    return "EVENT_NOT_LIVE";
+  }
+  return "EVENT_NOT_FOUND";
+}
+
+/** Email verification is required before event participation (§17.1). */
+export function unverifiedResponse(
+  c: AppContext,
+  user: { emailVerified: boolean }
+): Response | null {
+  if (user.emailVerified === false) {
+    return errorResponse(c, "FORBIDDEN", "Email verification required");
+  }
+  return null;
+}
+
 export function deriveObjectiveStatus(
   objectiveKey: string,
   dependsOn: string[],
@@ -557,10 +587,6 @@ export function checkAttemptGate(
     }
   }
   return { kind: "ok" };
-}
-
-export function isCompletableType(type: ObjectiveType): boolean {
-  return PHASE1_COMPLETABLE_OBJECTIVE_TYPES.includes(type);
 }
 
 export function sanitizeObjective(
@@ -645,8 +671,11 @@ async function computeFinishTimestamp(
     if (config === undefined) {
       return undefined;
     }
+    // Every required objective blocks the finish, regardless of type:
+    // manual_approval/timer/media objectives are completed through the admin
+    // manual-completion override, decisions through the player decision path.
     for (const objective of config.objectives) {
-      if (objective.required && isCompletableType(objective.type)) {
+      if (objective.required) {
         required.add(`${challenge.id}:${objective.key}`);
       }
     }
@@ -731,9 +760,11 @@ export async function completeObjective(input: CompletionInput): Promise<Complet
   const writes = [
     db
       .prepare(
-        "/*Q:add_participant_points*/ UPDATE participants SET event_points = ?, updated_at = ? WHERE id = ?"
+        // Relative delta, never a stale absolute: concurrent completions add
+        // up instead of overwriting each other.
+        "/*Q:add_participant_points*/ UPDATE participants SET event_points = event_points + ?, updated_at = ? WHERE id = ?"
       )
-      .bind(input.participant.event_points + input.eventPointsAward, now, input.participant.id)
+      .bind(input.eventPointsAward, now, input.participant.id)
   ];
   if (input.platformCreditsAward > 0) {
     const members = await listActiveMembers(db, input.participant.id);
@@ -1122,7 +1153,7 @@ challengesRouter.get("/api/challenges/:challengeId", async (c) => {
     )
   );
   const completed = config.objectives
-    .filter((objective) => objective.required && isCompletableType(objective.type))
+    .filter((objective) => objective.required)
     .every((objective) => rowsByKey.get(objective.key)?.status === "completed");
   return c.json({
     challenge: {
@@ -1156,6 +1187,10 @@ challengesRouter.post(
     const user = await resolveRequestUser(c);
     if (user === undefined) {
       return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
+    const unverified = unverifiedResponse(c, user);
+    if (unverified !== null) {
+      return unverified;
     }
     const db = c.env.DB;
     const challenge = await loadChallengeById(db, params.data.challengeId);
@@ -1282,6 +1317,19 @@ challengesRouter.post(
         details: { retry_after_seconds: attemptGate.retryAfterSeconds }
       });
     }
+    // After repeated failures the client must prove humanity (§17.5). Open
+    // (unconfigured) deployments skip this; the web client sends
+    // turnstileToken only when challenged.
+    if (turnstileRequired(c.env) && data.wrongAttempts >= WRONG_ATTEMPTS_TURNSTILE_THRESHOLD) {
+      const token = body.data.turnstileToken;
+      if (token === undefined) {
+        return errorResponse(c, "FORBIDDEN", "Verification required after repeated incorrect answers");
+      }
+      const human = await verifyTurnstile(c.env.TURNSTILE_SECRET_KEY ?? "", token, clientIp(c));
+      if (human === false) {
+        return errorResponse(c, "FORBIDDEN", "Verification failed");
+      }
+    }
     const validationInput = buildValidationInput(objective, body.data.answer);
     if (validationInput === undefined) {
       return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
@@ -1295,13 +1343,12 @@ challengesRouter.post(
         lastAttemptAt: now
       };
       await upsertAttemptProgress(db, participant.id, challenge.id, objective.key, next);
-      if (objective.wrongAnswerPenaltyPoints > 0 && participant.event_points > 0) {
-        const reduced = Math.max(0, participant.event_points - objective.wrongAnswerPenaltyPoints);
+      if (objective.wrongAnswerPenaltyPoints > 0) {
         await db
           .prepare(
-            "/*Q:subtract_participant_points*/ UPDATE participants SET event_points = ?, updated_at = ? WHERE id = ?"
+            "/*Q:subtract_participant_points*/ UPDATE participants SET event_points = MAX(0, event_points - ?), updated_at = ? WHERE id = ?"
           )
-          .bind(reduced, now, participant.id)
+          .bind(objective.wrongAnswerPenaltyPoints, now, participant.id)
           .run();
       }
       if (objective.maxAttempts === undefined) {
@@ -1334,19 +1381,23 @@ challengesRouter.post(
 );
 
 challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", async (c) => {
-  const parsed = hintParams.safeParse({
+  const hintParamsParsed = hintParams.safeParse({
     challengeId: c.req.param("challengeId"),
     hintKey: c.req.param("hintKey")
   });
-  if (parsed.success === false) {
+  if (hintParamsParsed.success === false) {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid hint ref");
   }
   const user = await resolveRequestUser(c);
   if (user === undefined) {
     return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
   }
+  const hintUnverified = unverifiedResponse(c, user);
+  if (hintUnverified !== null) {
+    return hintUnverified;
+  }
   const db = c.env.DB;
-  const challenge = await loadChallengeById(db, parsed.data.challengeId);
+  const challenge = await loadChallengeById(db, hintParamsParsed.data.challengeId);
   if (challenge === undefined) {
     return errorResponse(c, "NOT_FOUND", "Challenge not found");
   }
@@ -1380,7 +1431,7 @@ challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", asyn
     | { key: string; text: string; costPoints: number; objectiveKey: string }
     | undefined;
   for (const objective of config.objectives) {
-    const found = objective.hints.find((entry) => entry.key === parsed.data.hintKey);
+    const found = objective.hints.find((entry) => entry.key === hintParamsParsed.data.hintKey);
     if (found !== undefined) {
       hint = {
         key: found.key,
@@ -1414,7 +1465,6 @@ challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", asyn
     });
   }
   const now = nowIso();
-  const charged = Math.max(0, participant.event_points - hint.costPoints);
   const next: ProgressData = {
     ...data,
     hintsUnlocked: [...data.hintsUnlocked, hint.key]
@@ -1422,15 +1472,17 @@ challengesRouter.post("/api/challenges/:challengeId/hints/:hintKey/unlock", asyn
   await upsertAttemptProgress(db, participant.id, challenge.id, hint.objectiveKey, next);
   await db
     .prepare(
-      "/*Q:subtract_participant_points*/ UPDATE participants SET event_points = ?, updated_at = ? WHERE id = ?"
+      "/*Q:subtract_participant_points*/ UPDATE participants SET event_points = MAX(0, event_points - ?), updated_at = ? WHERE id = ?"
     )
-    .bind(charged, now, participant.id)
+    .bind(hint.costPoints, now, participant.id)
     .run();
+  const balance = await getActiveParticipant(db, user.id, event.id);
+  const eventPoints = balance?.event_points ?? Math.max(0, participant.event_points - hint.costPoints);
   return c.json({
     hintKey: hint.key,
     text: hint.text,
     costPoints: hint.costPoints,
-    eventPoints: charged,
+    eventPoints,
     alreadyUnlocked: false
   });
 });

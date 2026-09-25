@@ -42,6 +42,7 @@ class FakeDb {
     participant_members: [],
     team_invites: [],
     challenges: [],
+    objective_progress: [],
     announcements: [],
     audit_log: []
   };
@@ -112,6 +113,19 @@ class FakeDb {
         null
       );
     }
+    if (query.includes("COLLATE NOCASE")) {
+      const name = params[1];
+      return (
+        this.table("participants").find(
+          (row) =>
+            row["event_id"] === params[0] &&
+            row["type"] === "team" &&
+            typeof row["name"] === "string" &&
+            typeof name === "string" &&
+            row["name"].toLowerCase() === name.toLowerCase()
+        ) ?? null
+      );
+    }
     throw new Error(`unsupported first query: ${query}`);
   }
 
@@ -137,6 +151,26 @@ class FakeDb {
         .sort((left, right) =>
           String(left["starts_at"]).localeCompare(String(right["starts_at"]))
         );
+    }
+    if (query.includes("INNER JOIN participants AS p")) {
+      const out: Array<Row> = [];
+      for (const member of this.table("participant_members")) {
+        if (member["user_id"] !== params[0]) {
+          continue;
+        }
+        const participant = this.table("participants").find(
+          (row) => row["id"] === member["participant_id"]
+        );
+        if (participant !== undefined && participant["event_id"] === params[1]) {
+          out.push({ joined_at: member["joined_at"], left_at: member["left_at"] });
+        }
+      }
+      return out;
+    }
+    if (query.includes("progress_completed_participant")) {
+      return this.table("objective_progress").filter(
+        (row) => row["participant_id"] === params[0] && row["status"] === "completed"
+      );
     }
     if (query.includes("FROM challenges WHERE event_id = ?")) {
       return this.table("challenges")
@@ -379,8 +413,10 @@ async function seedWorld(extraEvents: Array<Row> = []): Promise<Seed> {
       objectives: [
         {
           key: "q1",
-          expectedAnswer: "TOP-SECRET-ANSWER",
-          location: { latitude: 28.6139, longitude: 77.209 }
+          type: "text_answer",
+          prompt: "Say the word",
+          validationMode: "exact",
+          expectedAnswer: "TOP-SECRET-ANSWER"
         }
       ]
     }),
@@ -610,7 +646,13 @@ describe("event state", () => {
         participant: participantSchema.nullable(),
         counts: z.object({ challenges: z.number(), participants: z.number() }),
         challenges: z.array(
-          z.object({ id: z.string(), title: z.string(), position: z.number() })
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            description: z.string().nullable(),
+            position: z.number(),
+            locked: z.boolean()
+          })
         ),
         announcements: z.array(
           z.object({ id: z.string(), title: z.string(), publishedAt: z.string() })
@@ -623,10 +665,166 @@ describe("event state", () => {
     }
     expect(parsed.data.participant?.eventId).toBe("ev-open");
     expect(parsed.data.counts).toEqual({ challenges: 1, participants: 1 });
+    expect(parsed.data.challenges[0]).toMatchObject({ id: "ch-open-1", locked: false });
     expect(parsed.data.announcements.map((entry) => entry.id)).toEqual(["ann-live"]);
     const raw = JSON.stringify(res.json);
     expect(raw).not.toContain("TOP-SECRET-ANSWER");
-    expect(raw).not.toContain("28.6139");
     expect(raw).not.toContain("configuration_json");
+  });
+});
+
+describe("registration modes and visibility", () => {
+  it("enforces solo_only and team_only participation modes", async () => {
+    const seed = await seedWorld([
+      {
+        id: "ev-solo",
+        name: "Solo Night",
+        slug: "solo-night",
+        description: null,
+        status: "scheduled",
+        starts_at: NOW,
+        ends_at: null,
+        settings_json: JSON.stringify({ participation: "solo_only" }),
+        created_by: "alice",
+        created_at: NOW,
+        updated_at: NOW
+      },
+      {
+        id: "ev-team",
+        name: "Team Night",
+        slug: "team-night",
+        description: null,
+        status: "scheduled",
+        starts_at: NOW,
+        ends_at: null,
+        settings_json: JSON.stringify({ participation: "team_only" }),
+        created_by: "alice",
+        created_at: NOW,
+        updated_at: NOW
+      }
+    ]);
+    const teamOnSolo = await api(seed.db, "POST", "/api/events/solo-night/register", seed.tokenAlice, {
+      participation: "team",
+      name: "Sneaky Crew"
+    });
+    expect(teamOnSolo.status).toBe(403);
+    const soloOk = await api(seed.db, "POST", "/api/events/solo-night/register", seed.tokenAlice, {});
+    expect(soloOk.status).toBe(201);
+    const soloOnTeam = await api(seed.db, "POST", "/api/events/team-night/register", seed.tokenBob, {});
+    expect(soloOnTeam.status).toBe(403);
+    const teamOk = await api(seed.db, "POST", "/api/events/team-night/register", seed.tokenBob, {
+      participation: "team",
+      name: "Bob Crew"
+    });
+    expect(teamOk.status).toBe(201);
+  });
+
+  it("rejects duplicate team names on registration", async () => {
+    const seed = await seedWorld();
+    const first = await api(seed.db, "POST", "/api/events/open-night/register", seed.tokenAlice, {
+      participation: "team",
+      name: "Night Owls"
+    });
+    expect(first.status).toBe(201);
+    const second = await api(seed.db, "POST", "/api/events/open-night/register", seed.tokenBob, {
+      participation: "team",
+      name: "night owls"
+    });
+    expect(second.status).toBe(409);
+  });
+
+  it("requires a verified email before registering", async () => {
+    const seed = await seedWorld();
+    seed.db.table("users").push({
+      id: "mallory",
+      auth_provider_id: "auth-mallory",
+      email: "mallory@example.com",
+      email_verified: 0,
+      username: "mallory",
+      display_name: null,
+      platform_credits: 0,
+      presence_visibility: "visible",
+      created_at: NOW,
+      updated_at: NOW
+    });
+    seed.db.table("sessions").push({
+      id: "sess-mallory",
+      user_id: "mallory",
+      token_hash: await sha256Hex("token-mallory"),
+      device_label: null,
+      ip_hash: null,
+      created_at: NOW,
+      last_seen_at: NOW,
+      expires_at: LATER,
+      revoked_at: null
+    });
+    const res = await api(seed.db, "POST", "/api/events/open-night/register", "token-mallory", {});
+    expect(res.status).toBe(403);
+    const parsed = envelopeSchema.safeParse(res.json);
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("FORBIDDEN");
+    } else {
+      expect.unreachable();
+    }
+  });
+
+  it("omits hidden challenges and shells locked ones in state", async () => {
+    const seed = await seedWorld();
+    await api(seed.db, "POST", "/api/events/open-night/register", seed.tokenAlice, {});
+    seed.db.table("challenges").push({
+      id: "ch-hidden",
+      event_id: "ev-open",
+      title: "Secret Vault",
+      description: "You should never see this",
+      position: 2,
+      configuration_json: JSON.stringify({
+        objectives: [{ key: "s1", type: "text_answer", prompt: "Secret" }],
+        requires: ["ch-missing"],
+        hiddenUntilUnlocked: true
+      }),
+      created_at: NOW,
+      updated_at: NOW
+    });
+    seed.db.table("challenges").push({
+      id: "ch-locked",
+      event_id: "ev-open",
+      title: "Gated Door",
+      description: "Locked detail text",
+      position: 3,
+      configuration_json: JSON.stringify({
+        objectives: [{ key: "g1", type: "text_answer", prompt: "Gated" }],
+        requires: ["ch-missing"]
+      }),
+      created_at: NOW,
+      updated_at: NOW
+    });
+    const res = await api(seed.db, "GET", "/api/events/open-night/state", seed.tokenAlice);
+    expect(res.status).toBe(200);
+    const parsed = z
+      .object({
+        challenges: z.array(
+          z.object({
+            id: z.string(),
+            title: z.string(),
+            description: z.string().nullable(),
+            locked: z.boolean()
+          })
+        )
+      })
+      .catchall(z.unknown())
+      .safeParse(res.json);
+    expect(parsed.success).toBe(true);
+    if (parsed.success === false) {
+      return;
+    }
+    const ids = parsed.data.challenges.map((entry) => entry.id);
+    expect(ids).not.toContain("ch-hidden");
+    expect(ids).toContain("ch-locked");
+    const locked = parsed.data.challenges.find((entry) => entry.id === "ch-locked");
+    expect(locked?.locked).toBe(true);
+    expect(locked?.description).toBeNull();
+    const raw = JSON.stringify(res.json);
+    expect(raw).not.toContain("Secret Vault");
+    expect(raw).not.toContain("Locked detail text");
   });
 });

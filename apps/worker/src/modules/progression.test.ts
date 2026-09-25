@@ -210,13 +210,12 @@ describe("validateRouteGraph", () => {
         nodeFor({ id: "a", requires: ["b"] }),
         nodeFor({ id: "b", requires: ["a"] })
       ])
-    ).toEqual(["dependency_cycle:a->b->a", "unreachable:a", "unreachable:b"]);
+    ).toEqual(["dependency_cycle:a->b->a"]);
   });
 
   it("reports self dependencies as cycles", () => {
     expect(validateRouteGraph([nodeFor({ id: "a", requires: ["a"], isTerminal: true })])).toEqual([
       "dependency_cycle:a->a",
-      "unreachable:a",
       "missing_final_target"
     ]);
   });
@@ -362,8 +361,9 @@ describe("validateEventForPublish with route checks", () => {
       ]
     });
     expect(result.ok).toBe(false);
-    expect(result.reasons).toContain("unreachable:ch-b");
-    expect(result.reasons).toContain("unreachable:ch-c");
+    expect(result.reasons).toContain("dependency_cycle:ch-b->ch-c->ch-b");
+    expect(result.reasons).not.toContain("unreachable:ch-b");
+    expect(result.reasons).not.toContain("unreachable:ch-c");
   });
 
   it("rejects routes with direct dependency cycles", () => {

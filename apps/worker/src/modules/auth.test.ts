@@ -350,6 +350,7 @@ const meSchema = z.object({
   displayName: z.string().nullable(),
   platformCredits: z.number().int(),
   presenceVisibility: z.enum(["visible", "count_only", "hidden"]),
+  isAdmin: z.boolean(),
   createdAt: z.string().min(1),
   updatedAt: z.string().min(1),
 });
@@ -450,7 +451,8 @@ describe("auth login and profile roundtrip", () => {
     const setCookie = login.headers.get("set-cookie") ?? "";
     expect(setCookie).toContain("cmp_session=");
     expect(setCookie).toContain("HttpOnly");
-    expect(setCookie).toContain("Secure");
+    // Development serves plain http, so the cookie must not be Secure here.
+    expect(setCookie).not.toContain("Secure");
     expect(setCookie).toContain("SameSite=Lax");
     expect(setCookie).toContain("Max-Age=2592000");
 
@@ -845,5 +847,38 @@ describe("clerk session JWT login", () => {
       expect(envelope.data.code).toBe("FORBIDDEN");
     }
     expect(harness.db.users).toHaveLength(0);
+  });
+
+  it("marks the session cookie Secure outside local development", async () => {
+    const db = new FakeDb();
+    const stagingEnv: Env = { ...testEnv(db), ENVIRONMENT: "staging" };
+    const res = await app.request(
+      "/api/auth/login",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          providerToken: "dev:staged@example.com",
+          username: "staged_player"
+        })
+      },
+      stagingEnv
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("set-cookie") ?? "").toContain("Secure");
+  });
+
+  it("reports an unresolvable provider token as a validation error", async () => {
+    const db = new FakeDb();
+    const res = await loginRequest(db, {
+      providerToken: "opaque-token-without-provider",
+      username: "lost_player"
+    });
+    expect(res.status).toBe(400);
+    const envelope = envelopeSchema.safeParse(await res.json());
+    expect(envelope.success).toBe(true);
+    if (envelope.success) {
+      expect(envelope.data.code).toBe("VALIDATION_ERROR");
+    }
   });
 });

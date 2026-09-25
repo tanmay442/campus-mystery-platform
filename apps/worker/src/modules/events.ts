@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import {
   eventSettingsSchema,
+  isChallengeUnlocked,
   isPublishedStatus,
   PUBLISHED_STATUSES
 } from "@campus/shared";
@@ -10,6 +11,16 @@ import type { AppEnv, DatabaseBinding } from "../env";
 import { timingSafeEqual } from "../lib/crypto";
 import { errorResponse } from "../lib/errors";
 import { nowIso } from "../lib/time";
+import {
+  listChallengesByEvent,
+  loadProgressionSnapshot,
+  parseConfiguration,
+  unverifiedResponse
+} from "./challenges";
+import {
+  readUserEventHistory,
+  userCooldownRemainingSeconds
+} from "./teams";
 
 const eventIdParams = z.object({ eventId: z.string().min(1) });
 
@@ -65,17 +76,6 @@ const memberRowSchema = z.object({
   role: z.string(),
   joined_at: z.string(),
   left_at: z.string().nullable()
-});
-
-const challengeRowSchema = z.object({
-  id: z.string(),
-  event_id: z.string(),
-  title: z.string(),
-  description: z.string().nullable(),
-  position: z.number(),
-  configuration_json: z.string(),
-  created_at: z.string(),
-  updated_at: z.string()
 });
 
 const announcementRowSchema = z.object({
@@ -196,12 +196,15 @@ async function hasApprovedInvite(
 }
 
 function emailDomain(email: string): string | null {
-  const parts = email.split("@");
-  const domain = parts[1];
-  if (domain === undefined || domain.length === 0) {
+  const at = email.lastIndexOf("@");
+  if (at < 0) {
     return null;
   }
-  return domain.toLowerCase();
+  const domain = email.slice(at + 1).toLowerCase();
+  if (domain.length === 0) {
+    return null;
+  }
+  return domain;
 }
 
 export const eventsRouter = new Hono<AppEnv>();
@@ -268,6 +271,10 @@ eventsRouter.post("/api/events/:eventId/register", async (c) => {
   if (user === undefined) {
     return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
   }
+  const unverified = unverifiedResponse(c, user);
+  if (unverified !== null) {
+    return unverified;
+  }
   const event = await findEvent(c.env.DB, params.data.eventId);
   if (
     event === null ||
@@ -316,37 +323,68 @@ eventsRouter.post("/api/events/:eventId/register", async (c) => {
     }
   }
   const now = nowIso();
-  const type = body.data.participation ?? "solo";
+  const requested = body.data.participation ?? "solo";
+  if (settings.participation === "solo_only" && requested === "team") {
+    return errorResponse(c, "FORBIDDEN", "This event allows solo participation only");
+  }
+  if (settings.participation === "team_only" && requested === "solo") {
+    return errorResponse(c, "FORBIDDEN", "This event requires team participation");
+  }
   const localPart = user.email.split("@")[0] ?? "player";
   const name =
-    body.data.name ?? (type === "team" ? `${localPart}'s team` : localPart);
+    body.data.name ?? (requested === "team" ? `${localPart}'s team` : localPart);
+  if (requested === "team") {
+    const clash = await c.env.DB.prepare(
+      "SELECT id FROM participants WHERE event_id = ? AND type = 'team' AND name = ? COLLATE NOCASE"
+    )
+      .bind(event.id, name)
+      .first();
+    if (clash !== null) {
+      return errorResponse(c, "CONFLICT", "Team name already taken for this event");
+    }
+  }
+  const history = await readUserEventHistory(c.env.DB, user.id, event.id);
+  const cooldown = userCooldownRemainingSeconds(history, Date.parse(now));
+  if (cooldown > 0) {
+    return errorResponse(c, "MEMBERSHIP_COOLDOWN", "Membership changed too recently", {
+      details: { retryAfterSeconds: cooldown }
+    });
+  }
   const participantId = crypto.randomUUID();
   const memberId = crypto.randomUUID();
-  const role = type === "team" ? "captain" : "member";
+  const role = requested === "team" ? "captain" : "member";
+  // Conditional inserts: concurrent duplicate registrations collapse onto
+  // the single surviving row instead of creating two active memberships.
   await c.env.DB.batch([
     c.env.DB.prepare(
-      "INSERT INTO participants (id, event_id, type, name, event_points, penalty_seconds, started_at, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO participants (id, event_id, type, name, event_points, penalty_seconds, started_at, completed_at, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM participant_members m JOIN participants p ON p.id = m.participant_id WHERE m.user_id = ? AND m.left_at IS NULL AND p.event_id = ?)"
     ).bind(
       participantId,
       event.id,
-      type,
+      requested,
       name,
       0,
       0,
       null,
       null,
       now,
-      now
+      now,
+      user.id,
+      event.id
     ),
     c.env.DB.prepare(
-      "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, ?, ?)"
-    ).bind(memberId, participantId, user.id, role, now, null)
+      "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM participants WHERE id = ?)"
+    ).bind(memberId, participantId, user.id, role, now, null, participantId)
   ]);
   const created = await getParticipant(c.env.DB, participantId);
-  if (created === null) {
-    return errorResponse(c, "INTERNAL", "Registration failed");
+  if (created !== null) {
+    return c.json({ participant: participantShape(created) }, 201);
   }
-  return c.json({ participant: participantShape(created) }, 201);
+  const raced = await findActiveParticipant(c.env.DB, event.id, user.id);
+  if (raced !== null) {
+    return c.json({ participant: participantShape(raced) });
+  }
+  return errorResponse(c, "CONFLICT", "Registration failed, retry instead");
 });
 
 eventsRouter.post("/api/events/:eventId/start", async (c) => {
@@ -359,6 +397,10 @@ eventsRouter.post("/api/events/:eventId/start", async (c) => {
   const user = c.get("user");
   if (user === undefined) {
     return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
+  const startUnverified = unverifiedResponse(c, user);
+  if (startUnverified !== null) {
+    return startUnverified;
   }
   const event = await findEvent(c.env.DB, params.data.eventId);
   if (
@@ -409,12 +451,51 @@ eventsRouter.get("/api/events/:eventId/state", async (c) => {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
   }
   const participant = await findActiveParticipant(c.env.DB, event.id, user.id);
-  const challengesRaw: unknown = (await c.env.DB.prepare(
-    "SELECT id, event_id, title, description, position, configuration_json, created_at, updated_at FROM challenges WHERE event_id = ? ORDER BY position ASC"
-  )
-    .bind(event.id)
-    .all()).results;
-  const challengeRows = z.array(challengeRowSchema).parse(challengesRaw);
+  const eventChallenges = await listChallengesByEvent(c.env.DB, event.id);
+  let snapshot: {
+    completedChallengeIds: string[];
+    decisionChoices: Record<string, Record<string, string>>;
+    now: string;
+  } | null = null;
+  if (participant !== null) {
+    snapshot = await loadProgressionSnapshot(c.env.DB, participant.id, eventChallenges);
+  }
+  const now = nowIso();
+  // Fail closed: challenges with unparsable configs are omitted, hidden
+  // challenges stay hidden until unlocked, and locked challenges are shelled
+  // without their description (§5.1, §10.4, §8.6).
+  const visible: Array<{
+    id: string;
+    title: string;
+    description: string | null;
+    position: number;
+    locked: boolean;
+  }> = [];
+  for (const row of eventChallenges) {
+    const config = parseConfiguration(row.configuration_json);
+    if (config === undefined) {
+      continue;
+    }
+    const unlocked =
+      snapshot === null
+        ? isChallengeUnlocked(config, [], {}, now)
+        : isChallengeUnlocked(
+            config,
+            snapshot.completedChallengeIds,
+            snapshot.decisionChoices,
+            snapshot.now
+          );
+    if (unlocked === false && config.hiddenUntilUnlocked) {
+      continue;
+    }
+    visible.push({
+      id: row.id,
+      title: row.title,
+      description: unlocked ? row.description : null,
+      position: row.position,
+      locked: unlocked === false
+    });
+  }
   const participantsRaw: unknown = (await c.env.DB.prepare(
     "SELECT id FROM participants WHERE event_id = ?"
   )
@@ -431,15 +512,10 @@ eventsRouter.get("/api/events/:eventId/state", async (c) => {
     event: publicEvent(event),
     participant: participant === null ? null : participantShape(participant),
     counts: {
-      challenges: challengeRows.length,
+      challenges: visible.length,
       participants: participantIds.length
     },
-    challenges: challengeRows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      description: row.description,
-      position: row.position
-    })),
+    challenges: visible,
     announcements: announcementRows.map((row) => ({
       id: row.id,
       title: row.title,

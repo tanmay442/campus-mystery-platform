@@ -18,6 +18,8 @@ interface FakeTables {
   participantMembers: Array<FakeRow>;
   teamInvites: Array<FakeRow>;
   objectiveProgress: Array<FakeRow>;
+  challenges: Array<FakeRow>;
+  penalties: Array<FakeRow>;
 }
 
 interface SeedInput {
@@ -28,6 +30,7 @@ interface SeedInput {
   members?: Array<FakeRow>;
   invites?: Array<FakeRow>;
   progress?: Array<FakeRow>;
+  challenges?: Array<FakeRow>;
 }
 
 function okResult(changes: number): unknown {
@@ -143,6 +146,9 @@ function handleAll(
         row["status"] === "pending"
     );
   }
+  if (sql.includes("FROM challenges WHERE event_id = ?")) {
+    return tables.challenges.filter((row) => row["event_id"] === values[0]);
+  }
   if (sql.includes("FROM objective_progress")) {
     const participantId = values[0];
     return tables.objectiveProgress
@@ -180,7 +186,7 @@ function handleRun(
     return okResult(1);
   }
   if (sql.startsWith("INSERT INTO participant_members")) {
-    if (sql.includes("SELECT")) {
+    if (sql.includes("SELECT") && sql.includes("team_invites")) {
       const participantId = values[1];
       const maxSize = values[7];
       const active = tables.participantMembers.filter(
@@ -198,6 +204,35 @@ function handleRun(
         alreadyMember === false &&
         invite !== undefined
       ) {
+        tables.participantMembers.push({
+          id: values[0],
+          participant_id: values[1],
+          user_id: values[2],
+          role: values[3],
+          joined_at: values[4],
+          left_at: values[5] ?? null
+        });
+        return okResult(1);
+      }
+      return okResult(0);
+    }
+    if (sql.includes("SELECT")) {
+      // Team-creation member row: only when the participant row survived and
+      // the user has no other active membership in the same event.
+      const created = tables.participants.find((row) => row["id"] === values[1]);
+      const clash =
+        created !== undefined &&
+        tables.participantMembers.some(
+          (row) =>
+            row["user_id"] === values[2] &&
+            isActiveMember(row) &&
+            tables.participants.some(
+              (entry) =>
+                entry["id"] === row["participant_id"] &&
+                entry["event_id"] === created["event_id"]
+            )
+        );
+      if (created !== undefined && clash === false) {
         tables.participantMembers.push({
           id: values[0],
           participant_id: values[1],
@@ -274,6 +309,20 @@ function handleRun(
     row["updated_at"] = values[1];
     return okResult(1);
   }
+  if (sql.startsWith("INSERT INTO penalties")) {
+    tables.penalties.push({
+      id: values[0],
+      participant_id: values[1],
+      admin_user_id: values[2],
+      seconds: values[3],
+      reason: values[4],
+      waived: values[5],
+      created_at: values[6],
+      updated_at: values[7],
+      waived_at: values[8]
+    });
+    return okResult(1);
+  }
   if (sql.startsWith("UPDATE participant_members SET left_at")) {
     const row = tables.participantMembers.find(
       (entry) => entry["id"] === values[1]
@@ -308,7 +357,9 @@ function createFakeDb(seed: SeedInput = {}): {
     participants: [...(seed.participants ?? [])],
     participantMembers: [...(seed.members ?? [])],
     teamInvites: [...(seed.invites ?? [])],
-    objectiveProgress: [...(seed.progress ?? [])]
+    objectiveProgress: [...(seed.progress ?? [])],
+    challenges: [...(seed.challenges ?? [])],
+    penalties: []
   };
   const seen = new WeakMap<object, { sql: string; values: Array<unknown> }>();
   const db: DatabaseBinding = {
@@ -762,6 +813,18 @@ describe("invites, requests, and approvals", () => {
     const bobApproval = approveResponseSchema.parse(bobApproved.json);
     expect(bobApproval.lateJoinPenaltyApplied).toBe(false);
     expect(bobApproval.penaltySeconds).toBe(0);
+    tables.challenges.push({
+      id: "challenge-1",
+      event_id: "event-1",
+      title: "First",
+      description: null,
+      position: 0,
+      configuration_json: JSON.stringify({
+        objectives: [{ key: "puzzle-1", type: "text_answer", prompt: "Go" }]
+      }),
+      created_at: "2026-01-01T00:00:00.000Z",
+      updated_at: "2026-01-01T00:00:00.000Z"
+    });
     tables.objectiveProgress.push({
       id: "progress-1",
       participant_id: team.participant.id,
@@ -835,5 +898,78 @@ describe("invites, requests, and approvals", () => {
       (row) => row["id"] === team.participant.id
     );
     expect(teamRow?.["penalty_seconds"]).toBe(0);
+  });
+});
+
+describe("team lifecycle gates and membership", () => {
+  async function getJson(
+    env: Env,
+    path: string,
+    token: string | null
+  ): Promise<{ status: number; json: unknown }> {
+    const headers: Record<string, string> = {};
+    if (token !== null) {
+      headers["Cookie"] = `session=${token}`;
+    }
+    const res = await app.request(path, { method: "GET", headers }, env);
+    const json: unknown = await res.json().catch(() => null);
+    return { status: res.status, json };
+  }
+
+  it("gates team creation on the event lifecycle", async () => {
+    const { env, tables, tokens } = await setupDb([
+      { id: "alice", username: "alice" }
+    ]);
+    const event = tables.events.find((row) => row["id"] === "event-1");
+    if (event === undefined) {
+      expect.unreachable();
+      return;
+    }
+    event["status"] = "paused";
+    const paused = await postJson(env, "/api/events/event-1/teams", tokenFor(tokens, "alice"), {
+      name: "Paused Crew"
+    });
+    expect(paused.status).toBe(201);
+    event["status"] = "completed";
+    const closed = await postJson(env, "/api/events/event-1/teams", tokenFor(tokens, "alice"), {
+      name: "Late Crew"
+    });
+    expect(closed.status).toBe(409);
+    expect(parseEnvelope(closed.json).code).toBe("EVENT_NOT_LIVE");
+    event["status"] = "draft";
+    const hidden = await postJson(env, "/api/events/event-1/teams", tokenFor(tokens, "alice"), {
+      name: "Draft Crew"
+    });
+    expect(hidden.status).toBe(404);
+  });
+
+  it("serves a membership summary to members and null to outsiders", async () => {
+    const { env, tokens } = await setupDb([
+      { id: "alice", username: "alice" },
+      { id: "bob", username: "bob" }
+    ]);
+    const created = await postJson(env, "/api/events/event-1/teams", tokenFor(tokens, "alice"), {
+      name: "Alpha Squad"
+    });
+    expect(created.status).toBe(201);
+    const member = await getJson(env, "/api/events/event-1/membership", tokenFor(tokens, "alice"));
+    expect(member.status).toBe(200);
+    const summary = z
+      .object({
+        participant: z.object({ name: z.string(), type: z.string() }),
+        members: z.array(z.object({ username: z.string(), role: z.string() })),
+        pendingRequests: z.array(z.unknown()),
+        canManage: z.boolean()
+      })
+      .safeParse(member.json);
+    expect(summary.success).toBe(true);
+    if (summary.success) {
+      expect(summary.data.participant.name).toBe("Alpha Squad");
+      expect(summary.data.members.map((entry) => entry.username)).toEqual(["alice"]);
+      expect(summary.data.canManage).toBe(true);
+    }
+    const outsider = await getJson(env, "/api/events/event-1/membership", tokenFor(tokens, "bob"));
+    expect(outsider.status).toBe(200);
+    expect(z.object({ participant: z.null() }).safeParse(outsider.json).success).toBe(true);
   });
 });

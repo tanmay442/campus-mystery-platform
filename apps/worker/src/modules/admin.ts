@@ -16,13 +16,17 @@ import type {
   RouteGraphNode
 } from "@campus/shared";
 import type { AppEnv, DatabaseBinding, PreparedStatementBinding } from "../env";
+import { sha256Hex } from "../lib/crypto";
 import { errorResponse } from "../lib/errors";
 import type { AppContext } from "../lib/errors";
 import { nowIso } from "../lib/time";
+import { serviceScopeSchema } from "../middleware/requireAdmin";
 import {
   completeObjective,
   eventGateStatus,
   getProgressOne,
+  listActiveMembers,
+  parseConfiguration,
   readProgressData
 } from "./challenges";
 
@@ -77,6 +81,14 @@ const manualCompletionBody = z
   })
   .catchall(z.unknown());
 
+const reversalBody = z
+  .object({
+    participantId: z.string().min(1),
+    challengeId: z.string().min(1),
+    note: z.string().max(500).optional()
+  })
+  .catchall(z.unknown());
+
 const penaltyBody = z
   .object({
     seconds: z.number().int().min(1).max(86400),
@@ -87,6 +99,17 @@ const penaltyBody = z
 const waiveBody = z
   .object({ note: z.string().max(500).optional() })
   .catchall(z.unknown());
+
+const serviceTokenBody = z
+  .object({
+    name: z.string().min(1).max(100),
+    scopes: z.array(serviceScopeSchema).min(1)
+  })
+  .catchall(z.unknown());
+
+const serviceTokenIdParams = z.object({
+  tokenId: z.string().min(1)
+});
 
 const publishBody = z.object({
   to: z.enum(["scheduled", "live"]).optional()
@@ -641,6 +664,39 @@ adminRouter.post("/api/admin/events/:eventId/duplicate", async (c) => {
   }
   const now = nowIso();
   const newEventId = crypto.randomUUID();
+  // Remap route-graph ids: prerequisites and branch targets must point at the
+  // copied challenges, never at the source event's ids.
+  const idMap = new Map<string, string>();
+  for (const challenge of sourceChallenges) {
+    idMap.set(challenge.id, crypto.randomUUID());
+  }
+  const remapConfiguration = (configurationJson: string): string => {
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(configurationJson);
+    } catch {
+      return configurationJson;
+    }
+    const parsed = challengeConfigurationSchema.safeParse(decoded);
+    if (parsed.success === false) {
+      return configurationJson;
+    }
+    const config = parsed.data;
+    const remapped = {
+      ...config,
+      requires: config.requires.map((id) => idMap.get(id) ?? id),
+      requiresDecision:
+        config.requiresDecision === undefined
+          ? undefined
+          : {
+              ...config.requiresDecision,
+              challengeId:
+                idMap.get(config.requiresDecision.challengeId) ??
+                config.requiresDecision.challengeId
+            }
+    };
+    return JSON.stringify(remapped);
+  };
   const statements: PreparedStatementBinding[] = [
     c.env.DB.prepare(
       "INSERT INTO events (id, name, slug, description, status, starts_at, ends_at, settings_json, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -659,16 +715,20 @@ adminRouter.post("/api/admin/events/:eventId/duplicate", async (c) => {
     )
   ];
   for (const challenge of sourceChallenges) {
+    const mapped = idMap.get(challenge.id);
+    if (mapped === undefined) {
+      continue;
+    }
     statements.push(
       c.env.DB.prepare(
         "INSERT INTO challenges (id, event_id, title, description, position, configuration_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
       ).bind(
-        crypto.randomUUID(),
+        mapped,
         newEventId,
         challenge.title,
         challenge.description,
         challenge.position,
-        challenge.configuration_json,
+        remapConfiguration(challenge.configuration_json),
         now,
         now
       )
@@ -716,14 +776,17 @@ adminRouter.post("/api/admin/events/:eventId/publish", async (c) => {
   if (status === next) {
     return c.json({ event: adminEvent(event) });
   }
-  const viaScheduled =
-    next === "live" && status !== "scheduled"
-      ? canTransition(status, "scheduled")
-      : true;
-  const reachable =
-    next === "scheduled"
-      ? canTransition(status, "scheduled")
-      : viaScheduled && canTransition("scheduled", "live");
+  // Publishing is stepwise: an event becomes scheduled first, then live.
+  // Jumping draft straight to live would skip the published-but-not-started
+  // window teams use to form (§9.1).
+  if (next === "live" && status !== "scheduled") {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Publish the event to scheduled before going live"
+    );
+  }
+  const reachable = canTransition(status, next);
   if (reachable === false) {
     return errorResponse(
       c,
@@ -863,6 +926,67 @@ adminRouter.post("/api/admin/events/:eventId/archive", async (c) => {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid event id");
   }
   return transitionEvent(c, parsed.data.eventId, admin.id, "event.archive", "archived", false);
+});
+
+const finalizeRowSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  event_points: z.number(),
+  penalty_seconds: z.number(),
+  completed_at: z.string().nullable()
+});
+
+adminRouter.post("/api/admin/events/:eventId/finalize", async (c) => {
+  // Marks investigated results final (§14.5): completed events only, audited
+  // with a top-3 snapshot. Does not change data, only records the decision.
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
+  const parsed = eventIdParams.safeParse({
+    eventId: c.req.param("eventId")
+  });
+  if (parsed.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid event id");
+  }
+  const event = await findEvent(c.env.DB, parsed.data.eventId);
+  if (event === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const status = parseStatus(event);
+  if (status === null) {
+    return errorResponse(c, "INTERNAL", "Event has an invalid status");
+  }
+  if (status !== "completed") {
+    return errorResponse(c, "CONFLICT", "Only completed events can be finalized");
+  }
+  const raw: unknown = (await c.env.DB
+    .prepare(
+      "SELECT id, name, event_points, penalty_seconds, completed_at FROM participants WHERE event_id = ?"
+    )
+    .bind(event.id)
+    .all()).results;
+  const rows = z.array(finalizeRowSchema).parse(raw);
+  const finished = rows
+    .filter((row) => row.completed_at !== null)
+    .map((row) => ({
+      participantId: row.id,
+      name: row.name,
+      officialFinishAt: new Date(
+        Date.parse(row.completed_at as string) + row.penalty_seconds * 1000
+      ).toISOString()
+    }))
+    .sort((left, right) => left.officialFinishAt.localeCompare(right.officialFinishAt));
+  const now = nowIso();
+  const snapshot = {
+    participantCount: rows.length,
+    finishedCount: finished.length,
+    top: finished.slice(0, 3)
+  };
+  await c.env.DB.batch([
+    auditEntry(c.env.DB, now, admin.id, "results.final", "event", event.id, snapshot)
+  ]);
+  return c.json({ finalized: true, eventId: event.id, ...snapshot });
 });
 
 adminRouter.post(
@@ -1171,28 +1295,224 @@ adminRouter.post(
       return errorResponse(c, "INTERNAL", "Failed to record manual completion");
     }
     const now = nowIso();
+    // Replays return the existing completion without side effects — including
+    // without audit noise.
+    if (outcome.result.replayed === false) {
+      await c.env.DB.batch([
+        auditEntry(
+          c.env.DB,
+          now,
+          admin.id,
+          "objective.manual_completion",
+          "objective_progress",
+          `${challenge.id}:${objective.key}`,
+          {
+            participantId: participant.id,
+            challengeId: challenge.id,
+            objectiveKey: objective.key,
+            note: body.data.note ?? null
+          }
+        )
+      ]);
+    }
+    return c.json({
+      completed: true,
+      manualCompletion: true,
+      ...outcome.result,
+      idempotentReplay: outcome.result.replayed
+    });
+  }
+);
+
+adminRouter.post(
+  "/api/admin/objectives/:objectiveId/reversal",
+  async (c) => {
+    const admin = c.get("user");
+    if (admin === undefined) {
+      return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
+    // Same addressing as manual-completion: :objectiveId is the objective key
+    // within the challenge given in the body.
+    const params = objectiveIdParams.safeParse({
+      objectiveId: c.req.param("objectiveId")
+    });
+    if (params.success === false) {
+      return errorResponse(c, "VALIDATION_ERROR", "Invalid objective id");
+    }
+    const raw: unknown = await c.req.json().catch(() => ({}));
+    const body = reversalBody.safeParse(raw);
+    if (body.success === false) {
+      return errorResponse(c, "VALIDATION_ERROR", "Invalid reversal payload");
+    }
+    const participant = await findParticipantById(c.env.DB, body.data.participantId);
+    if (participant === null) {
+      return errorResponse(c, "NOT_FOUND", "Participant not found");
+    }
+    const challenge = await findChallengeById(c.env.DB, body.data.challengeId);
+    if (challenge === null) {
+      return errorResponse(c, "NOT_FOUND", "Challenge not found");
+    }
+    if (participant.event_id !== challenge.event_id) {
+      return errorResponse(
+        c,
+        "VALIDATION_ERROR",
+        "Participant and challenge belong to different events"
+      );
+    }
+    const event = await findEvent(c.env.DB, challenge.event_id);
+    if (event === null) {
+      return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    if (event.status === "archived") {
+      return errorResponse(c, "CONFLICT", "Archived events are read-only");
+    }
+    if (
+      event.status === "draft" ||
+      event.status === "testing" ||
+      event.status === "scheduled"
+    ) {
+      return errorResponse(c, "EVENT_NOT_LIVE", "Reversal is not available for this event state");
+    }
+    let configuration: unknown;
+    try {
+      configuration = JSON.parse(challenge.configuration_json);
+    } catch {
+      return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+    }
+    const parsedConfig = challengeConfigurationSchema.safeParse(configuration);
+    if (parsedConfig.success === false) {
+      return errorResponse(c, "INTERNAL", "Challenge configuration is invalid");
+    }
+    const objective = parsedConfig.data.objectives.find(
+      (entry) => entry.key === params.data.objectiveId
+    );
+    if (objective === undefined) {
+      return errorResponse(c, "NOT_FOUND", "Objective not found");
+    }
+    const progress = await getProgressOne(
+      c.env.DB,
+      participant.id,
+      challenge.id,
+      objective.key
+    );
+    if (progress === undefined || progress.status !== "completed") {
+      return errorResponse(c, "NOT_FOUND", "No completed objective to reverse");
+    }
+    const now = nowIso();
+    const members = await listActiveMembers(c.env.DB, participant.id);
+    const deductions: Array<{ userId: string; amount: number }> = [];
+    if (objective.platformCredits > 0) {
+      for (const member of members) {
+        const userRaw: unknown = await c.env.DB
+          .prepare("SELECT id, platform_credits FROM users WHERE id = ?")
+          .bind(member.user_id)
+          .first();
+        const userParsed = z
+          .object({ id: z.string(), platform_credits: z.number() })
+          .safeParse(userRaw);
+        if (userParsed.success) {
+          deductions.push({
+            userId: userParsed.data.id,
+            amount: Math.min(userParsed.data.platform_credits, objective.platformCredits)
+          });
+        }
+      }
+    }
+    const statements: PreparedStatementBinding[] = [
+      c.env.DB.prepare("DELETE FROM objective_progress WHERE id = ?").bind(progress.id),
+      c.env.DB.prepare(
+        "UPDATE participants SET event_points = MAX(0, event_points - ?), updated_at = ? WHERE id = ?"
+      ).bind(objective.eventPoints, now, participant.id)
+    ];
+    for (const deduction of deductions) {
+      statements.push(
+        c.env.DB.prepare(
+          "UPDATE users SET platform_credits = MAX(0, platform_credits - ?), updated_at = ? WHERE id = ?"
+        ).bind(deduction.amount, now, deduction.userId)
+      );
+      statements.push(
+        c.env.DB.prepare(
+          "INSERT INTO credit_transactions (id, user_id, event_id, amount, reason, reference_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+        ).bind(
+          crypto.randomUUID(),
+          deduction.userId,
+          event.id,
+          -deduction.amount,
+          "manual_reversal",
+          `${challenge.id}:${objective.key}`,
+          now
+        )
+      );
+    }
+    await c.env.DB.batch(statements);
+    // If the reversed objective was load-bearing for the finish, reopen it.
+    if (participant.completed_at !== null) {
+      const allChallenges = await listChallenges(c.env.DB, event.id);
+      const required = new Set<string>();
+      for (const entry of allChallenges) {
+        const parsed = parseConfiguration(entry.configuration_json);
+        if (parsed === undefined) {
+          continue;
+        }
+        for (const item of parsed.objectives) {
+          if (item.required) {
+            required.add(`${entry.id}:${item.key}`);
+          }
+        }
+      }
+      const remaining: unknown = (await c.env.DB
+        .prepare(
+          "SELECT challenge_id, objective_key FROM objective_progress WHERE participant_id = ? AND status = 'completed'"
+        )
+        .bind(participant.id)
+        .all()).results;
+      const done = z
+        .array(z.object({ challenge_id: z.string(), objective_key: z.string() }))
+        .safeParse(remaining);
+      let complete = done.success;
+      if (done.success) {
+        for (const key of required) {
+          const [challengeId, objectiveKey] = key.split(":");
+          const found = done.data.some(
+            (row) =>
+              row.challenge_id === challengeId && row.objective_key === objectiveKey
+          );
+          if (found === false) {
+            complete = false;
+            break;
+          }
+        }
+      }
+      if (complete === false) {
+        await c.env.DB
+          .prepare("UPDATE participants SET completed_at = ?, updated_at = ? WHERE id = ?")
+          .bind(null, now, participant.id)
+          .run();
+      }
+    }
     await c.env.DB.batch([
       auditEntry(
         c.env.DB,
         now,
         admin.id,
-        "objective.manual_completion",
+        "objective.manual_reversal",
         "objective_progress",
         `${challenge.id}:${objective.key}`,
         {
           participantId: participant.id,
           challengeId: challenge.id,
           objectiveKey: objective.key,
-          note: body.data.note ?? null,
-          replayed: outcome.result.replayed
+          eventPointsRemoved: objective.eventPoints,
+          platformCreditsRemoved: deductions.reduce((sum, entry) => sum + entry.amount, 0),
+          note: body.data.note ?? null
         }
       )
     ]);
     return c.json({
-      completed: true,
-      manualCompletion: true,
-      ...outcome.result,
-      idempotentReplay: outcome.result.replayed
+      reversed: true,
+      participantId: participant.id,
+      challengeId: challenge.id,
+      objectiveKey: objective.key
     });
   }
 );
@@ -1223,8 +1543,20 @@ adminRouter.post(
     if (event === null) {
       return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
     }
-    if (event.status === "archived") {
-      return errorResponse(c, "CONFLICT", "Archived events are read-only");
+    // Time penalties are a live-operations tool: meaningless before the
+    // start, frozen once archived. Completed events stay adjustable so
+    // organisers can correct results before they are final (§14).
+    if (
+      event.status === "draft" ||
+      event.status === "testing" ||
+      event.status === "scheduled" ||
+      event.status === "archived"
+    ) {
+      return errorResponse(
+        c,
+        "CONFLICT",
+        "Penalties can only be applied while the event is live, paused, or completed"
+      );
     }
     const now = nowIso();
     const id = crypto.randomUUID();
@@ -1297,8 +1629,17 @@ adminRouter.post("/api/admin/penalties/:penaltyId/waive", async (c) => {
   if (event === null) {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
   }
-  if (event.status === "archived") {
-    return errorResponse(c, "CONFLICT", "Archived events are read-only");
+  if (
+    event.status === "draft" ||
+    event.status === "testing" ||
+    event.status === "scheduled" ||
+    event.status === "archived"
+  ) {
+    return errorResponse(
+      c,
+      "CONFLICT",
+      "Penalties can only be waived while the event is live, paused, or completed"
+    );
   }
   const now = nowIso();
   await c.env.DB.batch([
@@ -1377,6 +1718,84 @@ adminRouter.post(
   }
 );
 
+adminRouter.post("/api/admin/service-tokens", async (c) => {
+  // Token management is browser-session-only: automation can never mint or
+  // revoke its own access (§17.3).
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
+  if (c.get("serviceToken") !== undefined) {
+    return errorResponse(c, "FORBIDDEN", "Service tokens cannot manage tokens");
+  }
+  const raw: unknown = await c.req.json().catch(() => ({}));
+  const body = serviceTokenBody.safeParse(raw);
+  if (body.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid service token payload");
+  }
+  const now = nowIso();
+  const id = crypto.randomUUID();
+  const plaintext = `cmt_${crypto.randomUUID().replace(/-/g, "")}${crypto.randomUUID().replace(/-/g, "")}`;
+  const tokenHash = await sha256Hex(plaintext);
+  const scopesJson = JSON.stringify(body.data.scopes);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO service_tokens (id, name, token_hash, scopes_json, created_by, revoked_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+    ).bind(id, body.data.name, tokenHash, scopesJson, admin.id, null, now),
+    auditEntry(c.env.DB, now, admin.id, "service_token.create", "service_token", id, {
+      name: body.data.name,
+      scopes: body.data.scopes
+    })
+  ]);
+  return c.json(
+    {
+      token: {
+        id,
+        name: body.data.name,
+        scopes: body.data.scopes,
+        token: plaintext,
+        createdAt: now
+      }
+    },
+    201
+  );
+});
+
+adminRouter.post("/api/admin/service-tokens/:tokenId/revoke", async (c) => {
+  const admin = c.get("user");
+  if (admin === undefined) {
+    return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+  }
+  if (c.get("serviceToken") !== undefined) {
+    return errorResponse(c, "FORBIDDEN", "Service tokens cannot manage tokens");
+  }
+  const parsed = serviceTokenIdParams.safeParse({
+    tokenId: c.req.param("tokenId")
+  });
+  if (parsed.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid token id");
+  }
+  const raw: unknown = await c.env.DB
+    .prepare("SELECT id, revoked_at FROM service_tokens WHERE id = ? LIMIT 1")
+    .bind(parsed.data.tokenId)
+    .first();
+  const row = z
+    .object({ id: z.string(), revoked_at: z.string().nullable() })
+    .safeParse(raw);
+  if (row.success === false) {
+    return errorResponse(c, "NOT_FOUND", "Service token not found");
+  }
+  if (row.data.revoked_at !== null) {
+    return errorResponse(c, "CONFLICT", "Service token already revoked");
+  }
+  const now = nowIso();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE service_tokens SET revoked_at = ? WHERE id = ?").bind(now, row.data.id),
+    auditEntry(c.env.DB, now, admin.id, "service_token.revoke", "service_token", row.data.id, {})
+  ]);
+  return c.json({ revoked: true, tokenId: row.data.id });
+});
+
 adminRouter.get("/api/admin/audit", async (c) => {
   const admin = c.get("user");
   if (admin === undefined) {
@@ -1387,14 +1806,25 @@ adminRouter.get("/api/admin/audit", async (c) => {
     return errorResponse(c, "VALIDATION_ERROR", "Invalid query parameters");
   }
   const limit = query.data.limit ?? 50;
+  // Cursor is opaque `<created_at>|<id>`: created_at alone is not unique, so
+  // same-millisecond rows would be skipped or repeated without the id tiebreak.
   let sql =
     "SELECT id, admin_user_id, action, entity_type, entity_id, details_json, created_at FROM audit_log";
   const values: string[] = [];
   if (query.data.cursor !== undefined) {
-    sql += " WHERE created_at < ?";
-    values.push(query.data.cursor);
+    const separator = query.data.cursor.lastIndexOf("|");
+    if (separator < 0) {
+      return errorResponse(c, "VALIDATION_ERROR", "Invalid cursor");
+    }
+    const cursorAt = query.data.cursor.slice(0, separator);
+    const cursorId = query.data.cursor.slice(separator + 1);
+    if (cursorAt.length === 0 || cursorId.length === 0) {
+      return errorResponse(c, "VALIDATION_ERROR", "Invalid cursor");
+    }
+    sql += " WHERE created_at < ? OR (created_at = ? AND id < ?)";
+    values.push(cursorAt, cursorAt, cursorId);
   }
-  sql += ` ORDER BY created_at DESC LIMIT ${limit}`;
+  sql += ` ORDER BY created_at DESC, id DESC LIMIT ${limit}`;
   const stmt =
     values.length === 0
       ? c.env.DB.prepare(sql)
@@ -1412,6 +1842,6 @@ adminRouter.get("/api/admin/audit", async (c) => {
       details: row.details_json,
       createdAt: row.created_at
     })),
-    nextCursor: last === undefined ? null : last.created_at
+    nextCursor: last === undefined ? null : `${last.created_at}|${last.id}`
   });
 });

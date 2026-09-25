@@ -26,6 +26,10 @@ const CARDS = [
   {
     title: "Points, credits, hints",
     body: "Hints can cost points. Wrong answers can trigger cooldowns. Every completed objective is saved immediately."
+  },
+  {
+    title: "Nearby presence",
+    body: "During events, your presence may be counted in nearby-player totals and your username shown to others nearby. You are visible by default, but you can opt out at any time: open your profile and set presence to count-only or hidden. Gameplay is never affected."
   }
 ];
 

@@ -26,6 +26,7 @@ import {
   requireVerifiedUser,
   userCooldownRemainingSeconds
 } from "./teams";
+import { rosterGateStatus } from "./challenges";
 
 const participantIdParams = z.object({
   participantId: z.string().min(1)
@@ -100,6 +101,16 @@ participantsRouter.post("/api/participants/:participantId/leave", async (c) => {
   const participant = await readParticipant(db, params.data.participantId);
   if (participant === null) {
     return errorResponse(c, "NOT_FOUND", "Participant not found");
+  }
+  const leaveEvent = await readEvent(db, participant.eventId);
+  if (leaveEvent === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const leaveGate = rosterGateStatus(leaveEvent.status);
+  if (leaveGate !== null) {
+    const message =
+      leaveGate === "EVENT_NOT_FOUND" ? "Event not found" : "Team changes are closed for this event";
+    return errorResponse(c, leaveGate, message);
   }
   const membership = await readActiveMemberRow(
     db,
@@ -203,6 +214,16 @@ participantsRouter.post(
     }
     if (participant.kind !== "team") {
       return errorResponse(c, "CONFLICT", "Only teams have captains");
+    }
+    const transferEvent = await readEvent(db, participant.eventId);
+    if (transferEvent === null) {
+      return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    const transferGate = rosterGateStatus(transferEvent.status);
+    if (transferGate !== null) {
+      const message =
+        transferGate === "EVENT_NOT_FOUND" ? "Event not found" : "Team changes are closed for this event";
+      return errorResponse(c, transferGate, message);
     }
     const caller = await readActiveMemberRow(
       db,

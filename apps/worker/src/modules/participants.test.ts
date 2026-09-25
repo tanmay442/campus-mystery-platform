@@ -854,3 +854,53 @@ describe("solo entries", () => {
     expect(missing.ok).toBe(false);
   });
 });
+
+describe("departure lifecycle gates", () => {
+  it("blocks leaving once the event is completed", async () => {
+    const { env, tables, tokens } = await setupTeamDb(
+      [
+        { id: "alice", username: "alice" },
+        { id: "bob", username: "bob" }
+      ],
+      [
+        { userId: "alice", role: "captain", joinedAt: "2026-01-01T00:00:00.000Z" },
+        { userId: "bob", role: "member", joinedAt: "2026-02-01T00:00:00.000Z" }
+      ]
+    );
+    const event = tables.events.find((row) => row["id"] === "event-1");
+    if (event === undefined) {
+      expect.unreachable();
+      return;
+    }
+    event["status"] = "completed";
+    const res = await postJson(env, "/api/participants/team-1/leave", tokenFor(tokens, "bob"), {});
+    expect(res.status).toBe(409);
+    const parsed = envelopeSchema.safeParse(res.json);
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("EVENT_NOT_LIVE");
+    } else {
+      expect.unreachable();
+    }
+  });
+});
+
+describe("service token scope map", () => {
+  it("maps admin routes to the documented scopes", async () => {
+    const { scopeForAdminRequest } = await import("../middleware/requireAdmin");
+    expect(scopeForAdminRequest("GET", "/api/admin/audit")).toBe("events:read");
+    expect(scopeForAdminRequest("POST", "/api/admin/events")).toBe("events:write");
+    expect(scopeForAdminRequest("POST", "/api/admin/events/e/publish")).toBe("events:write");
+    expect(scopeForAdminRequest("POST", "/api/admin/events/e/challenges")).toBe("challenges:write");
+    expect(scopeForAdminRequest("PATCH", "/api/admin/challenges/c")).toBe("challenges:write");
+    expect(scopeForAdminRequest("POST", "/api/admin/objectives/k/reversal")).toBe(
+      "participants:moderate"
+    );
+    expect(scopeForAdminRequest("POST", "/api/admin/participants/p/penalties")).toBe(
+      "participants:moderate"
+    );
+    expect(scopeForAdminRequest("POST", "/api/admin/penalties/x/waive")).toBe(
+      "participants:moderate"
+    );
+    expect(scopeForAdminRequest("POST", "/api/admin/service-tokens")).toBeNull();
+  });
+});

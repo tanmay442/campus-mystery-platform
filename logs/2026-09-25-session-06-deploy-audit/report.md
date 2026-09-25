@@ -119,3 +119,81 @@ User picks the fix batch. Proposal: P0 backend correctness
 (C1, C3, C4, C5, C6, C7, C8, M1) → P1 hardening (M2–M4, M7–M10, minors) →
 UI track (C2/M11 + Astryx/Trophy/DecryptedText per parked plan) → pilot
 readiness (E2E login, load test, physical location test per §25).
+
+## Issues fixed (same session, no new log)
+
+All audit findings below were fixed on `main` after the audit above; only
+this section was appended per the user's instruction.
+
+- C1 — `state` now filters with `isChallengeUnlocked`: hidden-locked
+  challenges omitted, locked ones shelled with `description: null`,
+  unparsable configs fail closed (`events.ts`).
+- C2 — web rewritten to real worker contracts: `{code,message}` envelope
+  parsing with the full error-code union (`api.ts`); profile guard with
+  `isAdmin` (`session.ts`); ChallengeView/EventCentre/LeaderboardPage/
+  TeamPage remapped to worker shapes incl. hints unlock, location
+  verification flow, `?scope=`, and the new membership endpoint.
+- C3/M10 — all point mutations are relative deltas
+  (`event_points = event_points + ?`, `MAX(0, event_points - ?)`); hint
+  route re-reads the balance after charging.
+- C4 — every roster mutation (create/invite/request/approve/reject/leave/
+  transfer) passes `rosterGateStatus`: allowed in scheduled/live/paused,
+  blocked in draft/testing/completed/archived.
+- C5 — email-verification enforced on register, start, submit, hints,
+  location-session and verify (teams/admin paths already had it).
+- C6 — finish math, challenge `completed` flag and leaderboard
+  required-keys now count every required objective; manual_approval/timer/
+  media complete through the admin override, decisions through the player path.
+- C7 — duplicate remaps `requires`/`requiresDecision` to the copied ids.
+- C8 — registration enforces `settings.participation`, per-event team-name
+  uniqueness, and the 10-minute cooldown; inserts are conditional so races
+  collapse onto one row (same for team creation).
+- M1 — late penalty uses `settings.lateJoinPenaltySeconds`, fires only on
+  the first *required* completion, and writes a waivable `penalties` row
+  (`reason: late_join`).
+- M2 — leaderboard honors `winnerMode` (first/points/hybrid),
+  `leaderboardSize`, and `publicLeaderboard` (anonymous 403 when private);
+  draft/testing boards 404 (m1).
+- M3 — finished ties break by final-completion transaction time, then id.
+- M4 — rate limit keys on route pattern (no per-id bucket explosion), prunes
+  the map, and covers login/register/start/hints/leaderboard/membership/
+  leave.
+- M5 — Turnstile required on answer submits after 3 wrong attempts when a
+  secret is configured; still open when unconfigured (documented).
+- M6 — scoped service tokens (`service_tokens` table, migration 0003):
+  Bearer auth with per-route scopes, session-only issuance/revocation,
+  all audited.
+- M7 — `POST objectives/:key/reversal` (voids progress, returns points and
+  credits with `manual_reversal` ledger rows, reopens the finish, audited);
+  `POST events/:id/finalize` (completed-only, audited top-3 snapshot);
+  `disabled` challenge flag enforced as locked everywhere (radius changes
+  were already possible via PATCH).
+- M8 — capacity/single-membership enforced with conditional inserts verified
+  by re-read (approve path already had it); residual cross-isolate risk
+  documented, no schema change needed under D1 serialized batches.
+- M9 — partial unique index on pending join requests (migration 0004) with
+  a CONFLICT backstop in code.
+- M11 — `GET /api/me` returns server-computed `isAdmin`; admin UI gate works.
+- M12 — `location-session` has the same lifecycle gate as verification.
+- M13 — publish is stepwise (draft→scheduled→live); direct draft→live 409s.
+  Single-challenge terminal exemption kept intentionally (lone challenge is
+  trivially final; `isTerminal` is not consulted at runtime).
+- m2 — penalties/waivers blocked in draft/testing/scheduled/archived.
+- m3 — audit cursor is opaque `created_at|id` with exact pagination.
+- m4 — session sliding refresh only after 5 minutes stale.
+- m5 — cookie `Secure` everywhere except local development.
+- m6 — team-name input capped at 40 to match the contract.
+- m7 — email domain parsed after the last `@`.
+- m8 — unresolvable provider tokens return VALIDATION_ERROR, not INTERNAL.
+- m9 — manual-completion replays skip audit writes.
+- m10 — cycle members no longer double-reported as unreachable.
+- m11 — onboarding documents presence default + opt-out (profile PATCH
+  already supported visibility changes).
+- m12 — `/api/me/credits` limit-0 documented as balance-only.
+- Removed dead `isCompletableType`/`readEarliestCompletion` exports.
+
+Verification after fixes: typecheck 4/4, lint, build pass; tests 188/188
+(shared 9, db 1, web 6, worker 172 incl. ~40 new); migrations 0003+0004
+applied locally and to the staging D1. `staging` branch and the staging
+Worker still carry the pre-fix build — redeploy approval needed before the
+fixes go live. Production untouched.

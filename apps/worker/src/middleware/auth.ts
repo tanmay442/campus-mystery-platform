@@ -11,6 +11,10 @@ const SESSION_COOKIE = "cmp_session";
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Sliding refreshes write to D1; throttle them so 15s polling from hundreds
+// of players does not become continuous writes. Sessions still expire exactly.
+const SESSION_REFRESH_MIN_MS = 5 * 60 * 1000;
+
 const PUBLIC_ROUTES = new Set([
   "GET /api/health",
   "POST /api/auth/login",
@@ -20,7 +24,8 @@ const PUBLIC_ROUTES = new Set([
 
 const SESSION_LOOKUP_SQL = [
   "SELECT s.id AS session_id, s.revoked_at AS revoked_at,",
-  "s.expires_at AS expires_at, u.id AS user_id, u.email AS user_email,",
+  "s.expires_at AS expires_at, s.last_seen_at AS last_seen_at,",
+  "u.id AS user_id, u.email AS user_email,",
   "u.email_verified AS user_email_verified, u.username AS user_username",
   "FROM sessions s INNER JOIN users u ON s.user_id = u.id",
   "WHERE s.token_hash = ?",
@@ -33,6 +38,7 @@ const sessionRowSchema = z.object({
   session_id: z.string().min(1),
   revoked_at: z.string().nullable(),
   expires_at: z.string().min(1),
+  last_seen_at: z.string().optional(),
   user_id: z.string().min(1),
   user_email: z.string().email(),
   user_email_verified: z.number().int(),
@@ -63,10 +69,13 @@ export const authMiddleware = createMiddleware<AppEnv>(async (c, next) => {
     return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
   }
   const row = parsed.data;
-  const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
-  await c.env.DB.prepare(SLIDING_REFRESH_SQL)
-    .bind(now, expiresAt, row.session_id)
-    .run();
+  const lastSeenMs = row.last_seen_at === undefined ? NaN : Date.parse(row.last_seen_at);
+  if (Number.isNaN(lastSeenMs) || Date.now() - lastSeenMs >= SESSION_REFRESH_MIN_MS) {
+    const expiresAt = new Date(Date.now() + SESSION_TTL_MS).toISOString();
+    await c.env.DB.prepare(SLIDING_REFRESH_SQL)
+      .bind(now, expiresAt, row.session_id)
+      .run();
+  }
   c.set("user", {
     id: row.user_id,
     email: row.user_email,

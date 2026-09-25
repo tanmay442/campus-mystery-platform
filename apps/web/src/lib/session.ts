@@ -5,8 +5,11 @@ import { ApiError, apiGet, apiPost } from "./api";
 
 export interface SessionUser {
   id: string;
+  email: string;
   username: string;
   displayName: string | null;
+  platformCredits: number;
+  presenceVisibility: string;
   isAdmin: boolean;
 }
 
@@ -18,20 +21,19 @@ function isSessionUser(value: unknown): value is SessionUser {
   if (!isRecord(value)) return false;
   return (
     typeof value["id"] === "string" &&
+    typeof value["email"] === "string" &&
     typeof value["username"] === "string" &&
     (typeof value["displayName"] === "string" || value["displayName"] === null) &&
+    typeof value["platformCredits"] === "number" &&
+    typeof value["presenceVisibility"] === "string" &&
     typeof value["isAdmin"] === "boolean"
   );
-}
-
-function isNullableSessionUser(value: unknown): value is SessionUser | null {
-  return value === null || isSessionUser(value);
 }
 
 export function useSession() {
   return useQuery({
     queryKey: ["me"],
-    queryFn: () => apiGet<SessionUser | null>("/me", isNullableSessionUser),
+    queryFn: () => apiGet<SessionUser>("/me", isSessionUser),
     staleTime: 60_000
   });
 }

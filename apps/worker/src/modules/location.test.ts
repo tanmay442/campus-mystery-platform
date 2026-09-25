@@ -1142,3 +1142,28 @@ describe("verify location", () => {
     expect(session.status).toBe(404);
   });
 });
+
+describe("location lifecycle gates", () => {
+  it("withholds guidance while the event is paused", async () => {
+    const seed = await seedWorld("paused");
+    const res = await app.request(
+      "/api/challenges/ch1/objectives/loc1/location-session",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Cookie: `cmp_session=${seed.tokenU1}` },
+        body: JSON.stringify({})
+      },
+      testEnv(seed.db)
+    );
+    expect(res.status).toBe(409);
+    const parsed = z
+      .object({ code: z.string() })
+      .catchall(z.unknown())
+      .safeParse(await res.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("EVENT_PAUSED");
+    } else {
+      expect.unreachable();
+    }
+  });
+});

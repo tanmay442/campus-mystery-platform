@@ -215,10 +215,15 @@ export function validateRouteGraph(nodes: readonly RouteGraphNode[]): string[] {
   const visited = new Set<string>();
   const trail: string[] = [];
   const inTrail = new Set<string>();
+  const cycleMembers = new Set<string>();
   const visit = (id: string): void => {
     if (inTrail.has(id)) {
       const start = trail.indexOf(id);
-      reasons.push(`dependency_cycle:${[...trail.slice(start), id].join("->")}`);
+      const cycle = [...trail.slice(start), id];
+      reasons.push(`dependency_cycle:${cycle.join("->")}`);
+      for (const member of cycle) {
+        cycleMembers.add(member);
+      }
       return;
     }
     if (visited.has(id)) {
@@ -266,7 +271,9 @@ export function validateRouteGraph(nodes: readonly RouteGraphNode[]): string[] {
     }
   }
   for (const node of nodes) {
-    if (reachable.has(node.id) === false) {
+    // Nodes already reported as cycle members get only the cycle reason,
+    // not a redundant unreachable one.
+    if (reachable.has(node.id) === false && cycleMembers.has(node.id) === false) {
       reasons.push(`unreachable:${node.id}`);
     }
   }

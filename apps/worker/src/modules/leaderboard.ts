@@ -1,12 +1,12 @@
 /** Phase 1 leaderboard: official finish ranking with caller context. */
 
 import { Hono } from "hono";
-import { FIXED_DEFAULTS } from "@campus/shared";
+import { eventSettingsSchema } from "@campus/shared";
+import type { WinnerMode } from "@campus/shared";
 import { z } from "zod";
 import type { AppEnv } from "../env";
 import {
   getActiveParticipant,
-  isCompletableType,
   listChallengesByEvent,
   loadEventById,
   parseConfiguration,
@@ -57,24 +57,70 @@ interface RankedEntry {
   eventPoints: number;
   finished: boolean;
   officialFinishAt: string | undefined;
+  finalCompletionAt: string | undefined;
   requiredCompleted: number;
   lastCompletionAt: string | undefined;
+}
+
+function compareFinishOrder(left: RankedEntry, right: RankedEntry): number {
+  if (left.finished !== right.finished) {
+    return left.finished ? -1 : 1;
+  }
+  if (left.finished && right.finished) {
+    // Equal official timestamps break by earliest accepted final-completion
+    // transaction (§14.5), then participant id for determinism.
+    const byOfficial = (left.officialFinishAt ?? "").localeCompare(
+      right.officialFinishAt ?? ""
+    );
+    if (byOfficial !== 0) {
+      return byOfficial;
+    }
+    if (left.finalCompletionAt !== right.finalCompletionAt) {
+      if (left.finalCompletionAt === undefined) {
+        return 1;
+      }
+      if (right.finalCompletionAt === undefined) {
+        return -1;
+      }
+      const byFinal = left.finalCompletionAt.localeCompare(right.finalCompletionAt);
+      if (byFinal !== 0) {
+        return byFinal;
+      }
+    }
+    return left.participantId.localeCompare(right.participantId);
+  }
+  if (left.requiredCompleted !== right.requiredCompleted) {
+    return right.requiredCompleted - left.requiredCompleted;
+  }
+  if (left.lastCompletionAt === undefined || right.lastCompletionAt === undefined) {
+    if (left.lastCompletionAt === right.lastCompletionAt) {
+      return left.participantId.localeCompare(right.participantId);
+    }
+    return left.lastCompletionAt === undefined ? 1 : -1;
+  }
+  const byTime = left.lastCompletionAt.localeCompare(right.lastCompletionAt);
+  return byTime !== 0 ? byTime : left.participantId.localeCompare(right.participantId);
 }
 
 export function rankParticipants(
   participants: ParticipantRow[],
   completedByParticipant: Map<string, ProgressRow[]>,
-  requiredKeys: Set<string>
+  requiredKeys: Set<string>,
+  winnerMode: WinnerMode = "first_to_complete"
 ): RankedEntry[] {
   const entries: RankedEntry[] = participants.map((participant) => {
     const completed = completedByParticipant.get(participant.id) ?? [];
     let requiredCompleted = 0;
     let lastRequiredAt: string | undefined;
     let lastAnyAt: string | undefined;
+    let finalCompletionAt: string | undefined;
     for (const row of completed) {
       if (row.completed_at !== null) {
         if (lastAnyAt === undefined || row.completed_at > lastAnyAt) {
           lastAnyAt = row.completed_at;
+        }
+        if (finalCompletionAt === undefined || row.completed_at > finalCompletionAt) {
+          finalCompletionAt = row.completed_at;
         }
       }
       if (requiredKeys.has(`${row.challenge_id}:${row.objective_key}`)) {
@@ -98,28 +144,21 @@ export function rankParticipants(
       eventPoints: participant.event_points,
       finished,
       officialFinishAt,
+      finalCompletionAt,
       requiredCompleted,
       lastCompletionAt: lastRequiredAt ?? lastAnyAt
     };
   });
+  // first_to_complete ranks by finish order; highest_points and hybrid rank
+  // by event points first, with official finish time as tiebreaker (§9.4).
+  if (winnerMode === "first_to_complete") {
+    return entries.sort(compareFinishOrder);
+  }
   return entries.sort((left, right) => {
-    if (left.finished && right.finished) {
-      return (left.officialFinishAt ?? "").localeCompare(right.officialFinishAt ?? "");
+    if (left.eventPoints !== right.eventPoints) {
+      return right.eventPoints - left.eventPoints;
     }
-    if (left.finished !== right.finished) {
-      return left.finished ? -1 : 1;
-    }
-    if (left.requiredCompleted !== right.requiredCompleted) {
-      return right.requiredCompleted - left.requiredCompleted;
-    }
-    if (left.lastCompletionAt === undefined || right.lastCompletionAt === undefined) {
-      if (left.lastCompletionAt === right.lastCompletionAt) {
-        return left.participantId.localeCompare(right.participantId);
-      }
-      return left.lastCompletionAt === undefined ? 1 : -1;
-    }
-    const byTime = left.lastCompletionAt.localeCompare(right.lastCompletionAt);
-    return byTime !== 0 ? byTime : left.participantId.localeCompare(right.participantId);
+    return compareFinishOrder(left, right);
   });
 }
 
@@ -140,6 +179,32 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
   const event = await loadEventById(db, params.data.eventId);
   if (event === undefined) {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  // Leaderboards exist for running and historical events, never for
+  // unpublished ones (participant names would leak from drafts).
+  if (event.status === "draft" || event.status === "testing") {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const settingsRaw: unknown = await db
+    .prepare("/*Q:event_settings*/ SELECT settings_json FROM events WHERE id = ? LIMIT 1")
+    .bind(event.id)
+    .first();
+  let settings = eventSettingsSchema.parse({});
+  const settingsParsed = z.object({ settings_json: z.string() }).safeParse(settingsRaw);
+  if (settingsParsed.success) {
+    try {
+      const decoded: unknown = JSON.parse(settingsParsed.data.settings_json);
+      const validated = eventSettingsSchema.safeParse(decoded);
+      if (validated.success) {
+        settings = validated.data;
+      }
+    } catch {
+      // Fall through to defaults.
+    }
+  }
+  const callerUser = await resolveRequestUser(c);
+  if (settings.publicLeaderboard === false && callerUser === undefined) {
+    return errorResponse(c, "FORBIDDEN", "This leaderboard is private");
   }
   const participantRaw = (await db
     .prepare(
@@ -170,8 +235,10 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
     if (config === undefined) {
       continue;
     }
+    // Every required objective counts toward unfinished ranking (§14.4),
+    // including decision and admin-completed manual objectives.
     for (const objective of config.objectives) {
-      if (objective.required && isCompletableType(objective.type)) {
+      if (objective.required) {
         requiredKeys.add(`${challenge.id}:${objective.key}`);
       }
     }
@@ -202,7 +269,7 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
       completedByParticipant.set(row.participant_id, list);
     }
   }
-  const ranked = rankParticipants(participants, completedByParticipant, requiredKeys);
+  const ranked = rankParticipants(participants, completedByParticipant, requiredKeys, settings.winnerMode);
   const rankedWithPosition = ranked.map((entry, index) => ({
     rank: index + 1,
     participantId: entry.participantId,
@@ -215,10 +282,10 @@ leaderboardRouter.get("/api/events/:eventId/leaderboard", async (c) => {
     lastCompletionAt: entry.lastCompletionAt,
     isCaller: false
   }));
-  const limit = FIXED_DEFAULTS.leaderboardSize;
+  const limit = settings.leaderboardSize;
   const top = rankedWithPosition.slice(0, limit);
   const included = new Set(top.map((entry) => entry.participantId));
-  const user = await resolveRequestUser(c);
+  const user = callerUser;
   let caller: (typeof rankedWithPosition)[number] | null = null;
   if (user !== undefined) {
     const participant = await getActiveParticipant(db, user.id, event.id);

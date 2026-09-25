@@ -125,6 +125,7 @@ export const challengeConfigurationSchema = z.object({
   availableUntil: challengeDateSchema.optional(),
   hiddenUntilUnlocked: z.boolean().default(false),
   isTerminal: z.boolean().default(false),
+  disabled: z.boolean().default(false),
   requiresDecision: requiresDecisionSchema.optional()
 }).catchall(z.unknown());
 
@@ -132,7 +133,8 @@ export type ChallengeConfiguration = z.infer<typeof challengeConfigurationSchema
 
 export const submitAnswerBodySchema = z.object({
   answer: z.unknown(),
-  idempotencyKey: z.string().min(1).max(128).optional()
+  idempotencyKey: z.string().min(1).max(128).optional(),
+  turnstileToken: z.string().min(1).max(2048).optional()
 }).catchall(z.unknown());
 
 export type SubmitAnswerBody = z.infer<typeof submitAnswerBodySchema>;
@@ -323,6 +325,11 @@ export function isChallengeUnlocked(
   decisionChoices: Readonly<Record<string, Readonly<Record<string, string>>>>,
   nowIsoValue: string
 ): boolean {
+  // Disabled challenges are organiser-paused content: never unlocked through
+  // the player path, regardless of other rules (live-room "disable" control).
+  if (config.disabled) {
+    return false;
+  }
   for (const prerequisite of config.requires) {
     if (completedChallengeIds.includes(prerequisite) === false) {
       return false;

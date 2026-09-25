@@ -6,82 +6,106 @@ import type { ChallengeStatus } from "../components/ChallengeCard";
 import Countdown from "../components/Countdown";
 import { apiGet } from "../lib/api";
 
-interface ChallengeSummary {
+interface StateChallenge {
   id: string;
   title: string;
-  narrative: string;
-  status: ChallengeStatus;
-  points: number;
-  lockedReason: string | null;
+  description: string | null;
+  position: number;
+  locked: boolean;
 }
 
 interface Announcement {
   id: string;
+  title: string;
   body: string;
+  publishedAt: string | null;
 }
 
 interface EventState {
-  eventId: string;
-  eventName: string;
-  chapter: string | null;
-  startsAt: string | null;
-  endsAt: string | null;
-  participantName: string | null;
-  teamMemberCount: number | null;
-  currentObjective: string | null;
-  completedChallenges: number;
-  eventPoints: number;
-  creditBalance: number;
+  event: {
+    id: string;
+    name: string;
+    description: string | null;
+    status: string;
+    startsAt: string | null;
+    endsAt: string | null;
+  };
+  participant: {
+    id: string;
+    type: string;
+    name: string;
+    eventPoints: number;
+    penaltySeconds: number;
+    startedAt: string | null;
+    completedAt: string | null;
+  } | null;
+  counts: { challenges: number; participants: number };
+  challenges: StateChallenge[];
   announcements: Announcement[];
-  challenges: ChallengeSummary[];
+}
+
+interface Credits {
+  balance: number;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isStatus(value: unknown): value is ChallengeStatus {
-  return value === "locked" || value === "available" || value === "in_progress" || value === "completed";
-}
-
-function isChallengeSummary(value: unknown): value is ChallengeSummary {
-  if (!isRecord(value)) return false;
+function isStateChallenge(value: unknown): value is StateChallenge {
   return (
+    isRecord(value) &&
     typeof value["id"] === "string" &&
     typeof value["title"] === "string" &&
-    typeof value["narrative"] === "string" &&
-    isStatus(value["status"]) &&
-    typeof value["points"] === "number" &&
-    (typeof value["lockedReason"] === "string" || value["lockedReason"] === null)
+    (typeof value["description"] === "string" || value["description"] === null) &&
+    typeof value["position"] === "number" &&
+    typeof value["locked"] === "boolean"
   );
 }
 
 function isAnnouncement(value: unknown): value is Announcement {
-  if (!isRecord(value)) return false;
-  return typeof value["id"] === "string" && typeof value["body"] === "string";
+  return (
+    isRecord(value) &&
+    typeof value["id"] === "string" &&
+    typeof value["title"] === "string" &&
+    typeof value["body"] === "string"
+  );
 }
 
 function isEventState(value: unknown): value is EventState {
   if (!isRecord(value)) return false;
+  const event = value["event"];
+  const participant = value["participant"];
+  const counts = value["counts"];
   const challenges = value["challenges"];
   const announcements = value["announcements"];
   return (
-    typeof value["eventId"] === "string" &&
-    typeof value["eventName"] === "string" &&
-    (typeof value["chapter"] === "string" || value["chapter"] === null) &&
-    (typeof value["startsAt"] === "string" || value["startsAt"] === null) &&
-    (typeof value["endsAt"] === "string" || value["endsAt"] === null) &&
-    (typeof value["participantName"] === "string" || value["participantName"] === null) &&
-    (typeof value["teamMemberCount"] === "number" || value["teamMemberCount"] === null) &&
-    (typeof value["currentObjective"] === "string" || value["currentObjective"] === null) &&
-    typeof value["completedChallenges"] === "number" &&
-    typeof value["eventPoints"] === "number" &&
-    typeof value["creditBalance"] === "number" &&
-    Array.isArray(announcements) &&
-    announcements.every(isAnnouncement) &&
+    isRecord(event) &&
+    typeof event["id"] === "string" &&
+    typeof event["name"] === "string" &&
+    (participant === null ||
+      (isRecord(participant) &&
+        typeof participant["id"] === "string" &&
+        typeof participant["name"] === "string" &&
+        typeof participant["eventPoints"] === "number")) &&
+    isRecord(counts) &&
+    typeof counts["challenges"] === "number" &&
+    typeof counts["participants"] === "number" &&
     Array.isArray(challenges) &&
-    challenges.every(isChallengeSummary)
+    challenges.every(isStateChallenge) &&
+    Array.isArray(announcements) &&
+    announcements.every(isAnnouncement)
   );
+}
+
+function isCredits(value: unknown): value is Credits {
+  return isRecord(value) && typeof value["balance"] === "number";
+}
+
+function challengeStatus(challenge: StateChallenge, completed: boolean): ChallengeStatus {
+  if (completed) return "completed";
+  if (challenge.locked) return "locked";
+  return "available";
 }
 
 export default function EventCentre() {
@@ -93,6 +117,13 @@ export default function EventCentre() {
     queryKey: ["events", eventId, "state"],
     queryFn: () => apiGet(`/events/${eventId}/state`, isEventState),
     enabled: eventId.length > 0 && isSignedIn === true,
+    refetchInterval: 15_000
+  });
+
+  const credits = useQuery({
+    queryKey: ["me", "credits"],
+    queryFn: () => apiGet("/me/credits", isCredits),
+    enabled: isSignedIn === true,
     refetchInterval: 15_000
   });
 
@@ -117,26 +148,28 @@ export default function EventCentre() {
       {state.data ? (
         <>
           <header>
-            <p className="eyebrow">{state.data.chapter ?? "Event centre"}</p>
-            <h1>{state.data.eventName}</h1>
-            {state.data.endsAt ? <Countdown targetIso={state.data.endsAt} label="Ends in" /> : null}
-            {state.data.startsAt && !state.data.endsAt ? (
-              <Countdown targetIso={state.data.startsAt} label="Starts in" />
+            <p className="eyebrow">{state.data.event.status === "live" ? "Live now" : state.data.event.status}</p>
+            <h1>{state.data.event.name}</h1>
+            {state.data.event.description ? <p>{state.data.event.description}</p> : null}
+            {state.data.event.endsAt ? <Countdown targetIso={state.data.event.endsAt} label="Ends in" /> : null}
+            {state.data.event.startsAt && !state.data.event.endsAt ? (
+              <Countdown targetIso={state.data.event.startsAt} label="Starts in" />
             ) : null}
           </header>
 
           <section aria-label="Participant">
             <h2>Playing as</h2>
-            <p>{state.data.participantName ?? "Not registered yet"}</p>
-            {state.data.teamMemberCount !== null ? <p>Team members: {state.data.teamMemberCount}</p> : null}
-            {state.data.currentObjective ? <p>Current objective: {state.data.currentObjective}</p> : null}
+            <p>{state.data.participant?.name ?? "Not registered yet"}</p>
+            {state.data.participant?.completedAt ? (
+              <p role="status">Event complete. Official time was set by the server.</p>
+            ) : null}
           </section>
 
           <section aria-label="Score">
             <h2>Score</h2>
             <p>
-              {state.data.eventPoints} event points · {state.data.creditBalance} credits ·{" "}
-              {state.data.completedChallenges} challenges completed
+              {state.data.participant?.eventPoints ?? 0} event points ·{" "}
+              {credits.data?.balance ?? 0} credits · {state.data.counts.participants} participants
             </p>
             <Link className="button" to={`/events/${eventId}/leaderboard`}>
               View leaderboard
@@ -149,15 +182,24 @@ export default function EventCentre() {
             <ul className="stack">
               {state.data.challenges.map((challenge) => (
                 <li key={challenge.id}>
-                  <Link to={`/events/${eventId}/challenges/${challenge.id}`} aria-label={`Open ${challenge.title}`}>
+                  {challenge.locked ? (
                     <ChallengeCard
                       title={challenge.title}
-                      narrative={challenge.narrative}
-                      status={challenge.status}
-                      points={challenge.points}
-                      lockedReason={challenge.lockedReason ?? undefined}
+                      narrative="Unlock earlier challenges to reveal this one."
+                      status={challengeStatus(challenge, false)}
+                      points={0}
+                      lockedReason="Complete the previous steps first."
                     />
-                  </Link>
+                  ) : (
+                    <Link to={`/events/${eventId}/challenges/${challenge.id}`} aria-label={`Open ${challenge.title}`}>
+                      <ChallengeCard
+                        title={challenge.title}
+                        narrative={challenge.description ?? "Open to see the objectives."}
+                        status={challengeStatus(challenge, false)}
+                        points={state.data.participant?.eventPoints ?? 0}
+                      />
+                    </Link>
+                  )}
                 </li>
               ))}
             </ul>
@@ -169,7 +211,8 @@ export default function EventCentre() {
             <ul className="stack">
               {state.data.announcements.map((item) => (
                 <li key={item.id} className="card">
-                  {item.body}
+                  <h3>{item.title}</h3>
+                  <p>{item.body}</p>
                 </li>
               ))}
             </ul>

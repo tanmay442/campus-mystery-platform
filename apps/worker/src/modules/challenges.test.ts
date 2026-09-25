@@ -298,12 +298,29 @@ export class FakeDb {
       row["updated_at"] = params[2];
       return { success: true };
     }
-    if (marker === "add_participant_points" || marker === "subtract_participant_points") {
+    if (marker === "add_participant_points") {
       const row = this.table("participants").find((entry) => entry["id"] === params[2]);
       if (row === undefined) {
         throw new Error("participant not found");
       }
-      row["event_points"] = params[0];
+      const current = row["event_points"];
+      const award = params[0];
+      row["event_points"] =
+        typeof current === "number" && typeof award === "number" ? current + award : award;
+      row["updated_at"] = params[1];
+      return { success: true };
+    }
+    if (marker === "subtract_participant_points") {
+      const row = this.table("participants").find((entry) => entry["id"] === params[2]);
+      if (row === undefined) {
+        throw new Error("participant not found");
+      }
+      const current = row["event_points"];
+      const cost = params[0];
+      row["event_points"] =
+        typeof current === "number" && typeof cost === "number"
+          ? Math.max(0, current - cost)
+          : 0;
       row["updated_at"] = params[1];
       return { success: true };
     }
@@ -1351,6 +1368,38 @@ describe("challenge unlocking", () => {
     const parsed = errorSchema.safeParse(await res.json());
     if (parsed.success) {
       expect(parsed.data.code).toBe("VALIDATION_ERROR");
+    } else {
+      expect.unreachable();
+    }
+  });
+});
+
+describe("turnstile on repeated failures", () => {
+  it("requires verification after three wrong answers when configured", async () => {
+    const seed = await seedWorld("live");
+    const authedEnv = { ...testEnv(seed.db), TURNSTILE_SECRET_KEY: "test-secret" };
+    const submit = (answer: unknown) =>
+      app.request(
+        "/api/challenges/ch1/objectives/n1/submit",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Cookie: cookieFor(seed.tokenU1) },
+          body: JSON.stringify({ answer })
+        },
+        authedEnv
+      );
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const res = await submit("not-a-number");
+      expect(res.status).toBe(422);
+    }
+    const challenged = await submit("not-a-number");
+    expect(challenged.status).toBe(403);
+    const parsed = z
+      .object({ code: z.string() })
+      .catchall(z.unknown())
+      .safeParse(await challenged.json());
+    if (parsed.success) {
+      expect(parsed.data.code).toBe("FORBIDDEN");
     } else {
       expect.unreachable();
     }

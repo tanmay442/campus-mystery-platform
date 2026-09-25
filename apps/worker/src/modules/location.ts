@@ -133,6 +133,9 @@ locationRouter.post(
     if (user === undefined) {
       return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
     }
+    if (user.emailVerified === false) {
+      return errorResponse(c, "FORBIDDEN", "Email verification required");
+    }
     const db = c.env.DB;
     const challenge = await loadChallengeById(db, params.data.challengeId);
     if (challenge === undefined) {
@@ -141,6 +144,16 @@ locationRouter.post(
     const event = await loadEventById(db, challenge.event_id);
     if (event === undefined) {
       return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+    }
+    // Guidance (including coordinates when configured) is game content: same
+    // lifecycle gate as verification.
+    const sessionGate = eventGateStatus(event.status);
+    if (sessionGate !== null) {
+      const message =
+        sessionGate === "EVENT_PAUSED"
+          ? "The event is paused. Location guidance is unavailable until it resumes."
+          : "Location guidance is only available while the event is live.";
+      return errorResponse(c, sessionGate, message);
     }
     const participant = await getActiveParticipant(db, user.id, event.id);
     if (participant === undefined) {
@@ -227,6 +240,9 @@ locationRouter.post(
     const user = await resolveRequestUser(c);
     if (user === undefined) {
       return errorResponse(c, "UNAUTHENTICATED", "Authentication required");
+    }
+    if (user.emailVerified === false) {
+      return errorResponse(c, "FORBIDDEN", "Email verification required");
     }
     const db = c.env.DB;
     const challenge = await loadChallengeById(db, params.data.challengeId);

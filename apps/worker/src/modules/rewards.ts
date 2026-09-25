@@ -58,6 +58,7 @@ async function loadHistory(c: AppContext, limit: number): Promise<Response> {
 }
 
 rewardsRouter.get("/api/me/credits", async (c) => {
+  // Balance only: limit 0 intentionally returns no transaction rows.
   return loadHistory(c, 0);
 });
 

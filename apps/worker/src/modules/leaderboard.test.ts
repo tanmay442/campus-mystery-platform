@@ -106,7 +106,7 @@ class FakeDb {
         user_username: user["username"]
       };
     }
-    if (marker === "event_by_id") {
+    if (marker === "event_by_id" || marker === "event_settings") {
       return this.table("events").find((row) => row["id"] === params[0]) ?? null;
     }
     if (marker === "participant_for_user") {
@@ -644,5 +644,61 @@ describe("leaderboard route", () => {
       expect(parsed.data.entries[0]?.participantId).toBe("f2");
       expect(parsed.data.caller?.participantId).toBe("c1");
     }
+  });
+});
+
+describe("leaderboard settings and gates", () => {
+  it("ranks by event points when the winner mode is highest_points", async () => {
+    const seed = await seedWorld("live");
+    const event = seed.db.table("events").find((row) => row["id"] === "ev1");
+    if (event === undefined) {
+      expect.unreachable();
+      return;
+    }
+    event["settings_json"] = JSON.stringify({ winnerMode: "highest_points", leaderboardSize: 5 });
+    const res = await app.request(
+      "/api/events/ev1/leaderboard",
+      { headers: { Cookie: `cmp_session=${seed.tokenCaller}` } },
+      testEnv(seed.db)
+    );
+    expect(res.status).toBe(200);
+    const parsed = boardSchema.safeParse(await res.json());
+    expect(parsed.success).toBe(true);
+    if (parsed.success === false) {
+      return;
+    }
+    expect(parsed.data.leaderboardSize).toBe(5);
+    const points = parsed.data.entries.map((entry) => entry.eventPoints);
+    const sorted = [...points].sort((left, right) => right - left);
+    expect(points).toEqual(sorted);
+    expect(parsed.data.entries[0]?.eventPoints).toBe(30);
+  });
+
+  it("hides private leaderboards from anonymous viewers", async () => {
+    const seed = await seedWorld("live");
+    const event = seed.db.table("events").find((row) => row["id"] === "ev1");
+    if (event === undefined) {
+      expect.unreachable();
+      return;
+    }
+    event["settings_json"] = JSON.stringify({ publicLeaderboard: false });
+    const anonymous = await app.request("/api/events/ev1/leaderboard", {}, testEnv(seed.db));
+    expect(anonymous.status).toBe(403);
+    const authed = await app.request(
+      "/api/events/ev1/leaderboard",
+      { headers: { Cookie: `cmp_session=${seed.tokenCaller}` } },
+      testEnv(seed.db)
+    );
+    expect(authed.status).toBe(200);
+  });
+
+  it("returns EVENT_NOT_FOUND for draft events", async () => {
+    const seed = await seedWorld("draft");
+    const res = await app.request(
+      "/api/events/ev1/leaderboard",
+      { headers: { Cookie: `cmp_session=${seed.tokenCaller}` } },
+      testEnv(seed.db)
+    );
+    expect(res.status).toBe(404);
   });
 });

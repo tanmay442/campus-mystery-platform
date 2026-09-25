@@ -21,6 +21,7 @@ const app = new Hono<AppEnv>();
 
 app.use("/api/*", authMiddleware);
 app.use("/api/*", idempotencyMiddleware);
+app.use("/api/auth/login", rateLimitMiddleware);
 app.use(
   "/api/challenges/*/objectives/*/submit",
   rateLimitMiddleware
@@ -33,10 +34,19 @@ app.use(
   "/api/challenges/*/objectives/*/verify-location",
   rateLimitMiddleware
 );
+app.use(
+  "/api/challenges/*/hints/*/unlock",
+  rateLimitMiddleware
+);
 app.use("/api/events/*/presence", rateLimitMiddleware);
 app.use("/api/events/*/pings", rateLimitMiddleware);
+app.use("/api/events/*/register", rateLimitMiddleware);
+app.use("/api/events/*/start", rateLimitMiddleware);
+app.use("/api/events/*/leaderboard", rateLimitMiddleware);
+app.use("/api/events/*/membership", rateLimitMiddleware);
 app.use("/api/events/*/teams", rateLimitMiddleware);
 app.use("/api/participants/*/invites", rateLimitMiddleware);
+app.use("/api/participants/*/leave", rateLimitMiddleware);
 app.use("/api/invites/*/request", rateLimitMiddleware);
 app.use("/api/join-requests/*/approve", rateLimitMiddleware);
 app.use("/api/join-requests/*/reject", rateLimitMiddleware);

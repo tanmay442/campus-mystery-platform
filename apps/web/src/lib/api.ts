@@ -1,11 +1,24 @@
 export type ApiErrorCode =
   | "UNAUTHENTICATED"
   | "FORBIDDEN"
-  | "VALIDATION_ERROR"
-  | "RATE_LIMITED"
+  | "NOT_ADMIN"
+  | "EVENT_NOT_FOUND"
+  | "EVENT_NOT_LIVE"
   | "EVENT_PAUSED"
+  | "CHALLENGE_LOCKED"
+  | "OBJECTIVE_LOCKED"
+  | "INVALID_ANSWER"
+  | "TOO_MANY_ATTEMPTS"
   | "COOLDOWN"
   | "LOCATION_REJECTED"
+  | "POOR_ACCURACY"
+  | "TEAM_FULL"
+  | "MEMBERSHIP_COOLDOWN"
+  | "LATE_JOIN_PENALTY"
+  | "DUPLICATE_SUBMISSION"
+  | "IDEMPOTENCY_REPLAY"
+  | "RATE_LIMITED"
+  | "VALIDATION_ERROR"
   | "CONFLICT"
   | "NOT_FOUND"
   | "INTERNAL";
@@ -29,19 +42,34 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+const KNOWN_CODES: ReadonlySet<string> = new Set([
+  "UNAUTHENTICATED",
+  "FORBIDDEN",
+  "NOT_ADMIN",
+  "EVENT_NOT_FOUND",
+  "EVENT_NOT_LIVE",
+  "EVENT_PAUSED",
+  "CHALLENGE_LOCKED",
+  "OBJECTIVE_LOCKED",
+  "INVALID_ANSWER",
+  "TOO_MANY_ATTEMPTS",
+  "COOLDOWN",
+  "LOCATION_REJECTED",
+  "POOR_ACCURACY",
+  "TEAM_FULL",
+  "MEMBERSHIP_COOLDOWN",
+  "LATE_JOIN_PENALTY",
+  "DUPLICATE_SUBMISSION",
+  "IDEMPOTENCY_REPLAY",
+  "RATE_LIMITED",
+  "VALIDATION_ERROR",
+  "CONFLICT",
+  "NOT_FOUND",
+  "INTERNAL"
+]);
+
 export function isApiErrorCode(value: unknown): value is ApiErrorCode {
-  return (
-    value === "UNAUTHENTICATED" ||
-    value === "FORBIDDEN" ||
-    value === "VALIDATION_ERROR" ||
-    value === "RATE_LIMITED" ||
-    value === "EVENT_PAUSED" ||
-    value === "COOLDOWN" ||
-    value === "LOCATION_REJECTED" ||
-    value === "CONFLICT" ||
-    value === "NOT_FOUND" ||
-    value === "INTERNAL"
-  );
+  return typeof value === "string" && KNOWN_CODES.has(value);
 }
 
 function isApiErrorDetail(value: unknown): value is ApiErrorDetail {
@@ -49,28 +77,14 @@ function isApiErrorDetail(value: unknown): value is ApiErrorDetail {
   return isApiErrorCode(value["code"]) && typeof value["message"] === "string";
 }
 
-async function parseEnvelope<T>(
-  response: Response,
-  guard: (value: unknown) => value is T
-): Promise<T> {
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    throw new ApiError({ code: "INTERNAL", message: "The server returned an unreadable response." });
-  }
-  if (!isRecord(body)) {
-    throw new ApiError({ code: "INTERNAL", message: "The server returned an unreadable response." });
-  }
-  if ("error" in body) {
-    const detail = body["error"];
-    if (isApiErrorDetail(detail)) throw new ApiError(detail);
-    throw new ApiError({ code: "INTERNAL", message: "The server returned an unknown error." });
-  }
-  if (!("data" in body) || !guard(body["data"])) {
-    throw new ApiError({ code: "INTERNAL", message: "The server returned an unexpected shape." });
-  }
-  return body["data"];
+function fallbackForStatus(status: number): ApiErrorDetail {
+  if (status === 401) return { code: "UNAUTHENTICATED", message: "Sign in to continue." };
+  if (status === 403) return { code: "FORBIDDEN", message: "You do not have permission for this action." };
+  if (status === 404) return { code: "NOT_FOUND", message: "The requested item was not found." };
+  if (status === 429) return { code: "RATE_LIMITED", message: "Too many attempts. Wait a moment and retry." };
+  if (status === 409) return { code: "CONFLICT", message: "This conflicts with the current state. Refresh and retry." };
+  if (status === 422) return { code: "VALIDATION_ERROR", message: "The server could not accept that submission." };
+  return { code: "INTERNAL", message: "Something went wrong. Retry in a moment." };
 }
 
 async function send<T>(
@@ -88,22 +102,22 @@ async function send<T>(
   } catch {
     throw new ApiError({ code: "INTERNAL", message: "Could not reach the server. Check your connection and retry." });
   }
-  if (response.status === 401) {
-    throw new ApiError({ code: "UNAUTHENTICATED", message: "Sign in to continue." });
+  let body: unknown = null;
+  try {
+    body = await response.json();
+  } catch {
+    throw new ApiError(fallbackForStatus(response.status));
   }
-  if (response.status === 403) {
-    throw new ApiError({ code: "FORBIDDEN", message: "You do not have permission for this action." });
+  if (!response.ok) {
+    // The worker returns { code, message, details? } error envelopes.
+    if (isApiErrorDetail(body)) throw new ApiError(body);
+    if (isRecord(body) && isApiErrorDetail(body["error"])) throw new ApiError(body["error"]);
+    throw new ApiError(fallbackForStatus(response.status));
   }
-  if (response.status === 404) {
-    throw new ApiError({ code: "NOT_FOUND", message: "The requested item was not found." });
+  if (!guard(body)) {
+    throw new ApiError({ code: "INTERNAL", message: "The server returned an unexpected shape." });
   }
-  if (response.status === 429) {
-    throw new ApiError({ code: "RATE_LIMITED", message: "Too many attempts. Wait a moment and retry." });
-  }
-  if (response.status === 409) {
-    throw new ApiError({ code: "CONFLICT", message: "This conflicts with the current state. Refresh and retry." });
-  }
-  return parseEnvelope(response, guard);
+  return body;
 }
 
 export function apiGet<T>(path: string, guard: (value: unknown) => value is T): Promise<T> {
@@ -119,6 +133,22 @@ export function apiPost<T>(
     path,
     {
       method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    },
+    guard
+  );
+}
+
+export function apiPatch<T>(
+  path: string,
+  body: unknown,
+  guard: (value: unknown) => value is T
+): Promise<T> {
+  return send(
+    path,
+    {
+      method: "PATCH",
       headers: { Accept: "application/json", "Content-Type": "application/json" },
       body: JSON.stringify(body)
     },

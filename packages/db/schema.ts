@@ -191,6 +191,21 @@ export const penalties = sqliteTable(
   ],
 );
 
+export const serviceTokens = sqliteTable(
+  "service_tokens",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull().unique(),
+    scopesJson: text("scopes_json").notNull(),
+    createdBy: text("created_by")
+      .notNull()
+      .references(() => users.id),
+    revokedAt: text("revoked_at"),
+    createdAt: text("created_at").notNull(),
+  },
+);
+
 export const auditLog = sqliteTable("audit_log", {
   id: text("id").primaryKey(),
   adminUserId: text("admin_user_id")

@@ -9,7 +9,8 @@ import {
   TEAM_APPROVAL_WINDOW_SECONDS,
   canManageMembers,
   createInviteSchema,
-  createTeamSchema
+  createTeamSchema,
+  eventSettingsSchema
 } from "@campus/shared";
 import { Hono } from "hono";
 import { getCookie } from "hono/cookie";
@@ -23,6 +24,11 @@ import type { AppContext } from "../lib/errors";
 import { newId, sha256Hex } from "../lib/crypto";
 import { errorResponse } from "../lib/errors";
 import { nowIso } from "../lib/time";
+import {
+  listChallengesByEvent,
+  parseConfiguration,
+  rosterGateStatus
+} from "./challenges";
 
 const eventIdParams = z.object({ eventId: z.string().min(1) });
 
@@ -93,10 +99,6 @@ const historyRowSchema = z.object({
 
 const countRowSchema = z.object({
   count: z.number()
-});
-
-const completionRowSchema = z.object({
-  completed_at: z.string()
 });
 
 const runResultSchema = z
@@ -427,21 +429,85 @@ export async function countActiveMembers(
   return parsed.data.count;
 }
 
-export async function readEarliestCompletion(
+/**
+ * Earliest completion of a REQUIRED objective (§12.7: the late-join penalty
+ * fires only after the team's first required completion, never for optional
+ * objectives). Challenge configs are the source of required keys.
+ */
+export async function readEarliestRequiredCompletion(
   db: DatabaseBinding,
-  participantId: string
+  participantId: string,
+  eventId: string
 ): Promise<string | null> {
-  const raw = await db
-    .prepare(
-      "SELECT completed_at FROM objective_progress WHERE participant_id = ? AND status = 'completed' AND completed_at IS NOT NULL ORDER BY completed_at ASC LIMIT 1"
-    )
-    .bind(participantId)
-    .first();
-  const parsed = completionRowSchema.safeParse(raw);
-  if (parsed.success === false) {
+  const challenges = await listChallengesByEvent(db, eventId);
+  const required = new Set<string>();
+  for (const challenge of challenges) {
+    const config = parseConfiguration(challenge.configuration_json);
+    if (config === undefined) {
+      continue;
+    }
+    for (const objective of config.objectives) {
+      if (objective.required) {
+        required.add(`${challenge.id}:${objective.key}`);
+      }
+    }
+  }
+  if (required.size === 0) {
     return null;
   }
-  return parsed.data.completed_at;
+  const raw = (await db
+    .prepare(
+      "SELECT challenge_id, objective_key, completed_at FROM objective_progress WHERE participant_id = ? AND status = 'completed' AND completed_at IS NOT NULL"
+    )
+    .bind(participantId)
+    .all()).results;
+  const rows = z
+    .array(
+      z.object({
+        challenge_id: z.string(),
+        objective_key: z.string(),
+        completed_at: z.string()
+      })
+    )
+    .safeParse(raw);
+  if (rows.success === false) {
+    return null;
+  }
+  let earliest: string | null = null;
+  for (const row of rows.data) {
+    if (required.has(`${row.challenge_id}:${row.objective_key}`) === false) {
+      continue;
+    }
+    if (earliest === null || row.completed_at < earliest) {
+      earliest = row.completed_at;
+    }
+  }
+  return earliest;
+}
+
+export async function readEventPenaltySeconds(
+  db: DatabaseBinding,
+  eventId: string
+): Promise<number> {
+  const raw = await db
+    .prepare("SELECT settings_json FROM events WHERE id = ?")
+    .bind(eventId)
+    .first();
+  const parsed = z.object({ settings_json: z.string() }).safeParse(raw);
+  if (parsed.success === false) {
+    return LATE_JOIN_PENALTY_SECONDS;
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(parsed.data.settings_json);
+  } catch {
+    return LATE_JOIN_PENALTY_SECONDS;
+  }
+  const settings = eventSettingsSchema.safeParse(decoded);
+  if (settings.success === false) {
+    return LATE_JOIN_PENALTY_SECONDS;
+  }
+  return settings.data.lateJoinPenaltySeconds;
 }
 
 export async function requireVerifiedUser(
@@ -561,6 +627,18 @@ export function countRecentTeamChanges(
 
 export const teamsRouter = new Hono<AppEnv>();
 
+/** Lifecycle gate for every roster mutation (§9.1, §19.6). */
+function rosterGate(c: AppContext, event: StoredEvent): Response | null {
+  const gate = rosterGateStatus(event.status);
+  if (gate === null) {
+    return null;
+  }
+  if (gate === "EVENT_NOT_FOUND") {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  return errorResponse(c, "EVENT_NOT_LIVE", "Team changes are closed for this event");
+}
+
 teamsRouter.post("/api/events/:eventId/teams", async (c) => {
   const params = eventIdParams.safeParse({
     eventId: c.req.param("eventId")
@@ -585,6 +663,10 @@ teamsRouter.post("/api/events/:eventId/teams", async (c) => {
   const event = await readEvent(db, eventId);
   if (event === null) {
     return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const gated = rosterGate(c, event);
+  if (gated !== null) {
+    return gated;
   }
   const clash = await db
     .prepare(
@@ -622,10 +704,12 @@ teamsRouter.post("/api/events/:eventId/teams", async (c) => {
     );
   }
   const participantId = newId();
+  // Conditional inserts: a concurrent duplicate creation collapses onto the
+  // surviving row; the re-read below decides the outcome (§21.5).
   await db.batch([
     db
       .prepare(
-        "INSERT INTO participants (id, event_id, type, name, event_points, penalty_seconds, started_at, completed_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO participants (id, event_id, type, name, event_points, penalty_seconds, started_at, completed_at, created_at, updated_at) SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE NOT EXISTS (SELECT 1 FROM participant_members m JOIN participants p ON p.id = m.participant_id WHERE m.user_id = ? AND m.left_at IS NULL AND p.event_id = ?) AND NOT EXISTS (SELECT 1 FROM participants WHERE event_id = ? AND type = 'team' AND name = ? COLLATE NOCASE)"
       )
       .bind(
         participantId,
@@ -637,14 +721,26 @@ teamsRouter.post("/api/events/:eventId/teams", async (c) => {
         null,
         null,
         now,
-        now
+        now,
+        auth.user.id,
+        eventId,
+        eventId,
+        body.data.name
       ),
     db
       .prepare(
-        "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) VALUES (?, ?, ?, ?, ?, ?)"
+        "INSERT INTO participant_members (id, participant_id, user_id, role, joined_at, left_at) SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM participants WHERE id = ?)"
       )
-      .bind(newId(), participantId, auth.user.id, "captain", now, null)
+      .bind(newId(), participantId, auth.user.id, "captain", now, null, participantId)
   ]);
+  const createdParticipant = await readParticipant(db, participantId);
+  if (createdParticipant === null) {
+    const raced = await readActiveMembershipForUserEvent(db, auth.user.id, eventId);
+    if (raced !== null) {
+      return errorResponse(c, "CONFLICT", "Already participating in this event");
+    }
+    return errorResponse(c, "CONFLICT", "Team name already taken for this event");
+  }
   return c.json(
     {
       participant: {
@@ -689,6 +785,14 @@ teamsRouter.post("/api/participants/:participantId/invites", async (c) => {
   }
   if (participant.kind !== "team") {
     return errorResponse(c, "CONFLICT", "Only teams can create invites");
+  }
+  const inviteEvent = await readEvent(db, participant.eventId);
+  if (inviteEvent === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const inviteGated = rosterGate(c, inviteEvent);
+  if (inviteGated !== null) {
+    return inviteGated;
   }
   const caller = await readActiveMemberRow(
     db,
@@ -779,6 +883,14 @@ teamsRouter.post("/api/invites/:token/request", async (c) => {
   if (participant === null || participant.kind !== "team") {
     return errorResponse(c, "NOT_FOUND", "Team not found");
   }
+  const requestEvent = await readEvent(db, participant.eventId);
+  if (requestEvent === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const requestGated = rosterGate(c, requestEvent);
+  if (requestGated !== null) {
+    return requestGated;
+  }
   const existing = await readActiveMembershipForUserEvent(
     db,
     auth.user.id,
@@ -815,22 +927,33 @@ teamsRouter.post("/api/invites/:token/request", async (c) => {
     );
   }
   const requestId = newId();
-  await db
-    .prepare(
-      "INSERT INTO team_invites (id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
-    )
-    .bind(
-      requestId,
-      participant.id,
-      auth.user.id,
-      null,
-      auth.user.id,
-      invite.expiresAt,
-      now,
-      now
-    )
-    .run();
-  const earliestCompletion = await readEarliestCompletion(db, participant.id);
+  // The pending-request partial unique index is the backstop: a concurrent
+  // duplicate insert fails here and surfaces as CONFLICT instead of a second
+  // approvable row.
+  try {
+    await db
+      .prepare(
+        "INSERT INTO team_invites (id, participant_id, invited_by, token_hash, requested_user_id, status, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)"
+      )
+      .bind(
+        requestId,
+        participant.id,
+        auth.user.id,
+        null,
+        auth.user.id,
+        invite.expiresAt,
+        now,
+        now
+      )
+      .run();
+  } catch {
+    return errorResponse(c, "CONFLICT", "Join request already pending");
+  }
+  const earliestCompletion = await readEarliestRequiredCompletion(
+    db,
+    participant.id,
+    participant.eventId
+  );
   return c.json(
     {
       request: {
@@ -876,6 +999,14 @@ teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
   const participant = await readParticipant(db, request.participantId);
   if (participant === null || participant.kind !== "team") {
     return errorResponse(c, "NOT_FOUND", "Team not found");
+  }
+  const approveEvent = await readEvent(db, participant.eventId);
+  if (approveEvent === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const approveGated = rosterGate(c, approveEvent);
+  if (approveGated !== null) {
+    return approveGated;
   }
   const approver = await readActiveMemberRow(
     db,
@@ -934,10 +1065,15 @@ teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
   if (activeCount >= MAX_TEAM_SIZE) {
     return errorResponse(c, "TEAM_FULL", "Team is full");
   }
-  const earliestCompletion = await readEarliestCompletion(db, participant.id);
-  const penalty =
-    earliestCompletion === null ? 0 : LATE_JOIN_PENALTY_SECONDS;
+  const earliestCompletion = await readEarliestRequiredCompletion(
+    db,
+    participant.id,
+    participant.eventId
+  );
+  const configuredPenalty = await readEventPenaltySeconds(db, participant.eventId);
+  const penalty = earliestCompletion === null ? 0 : configuredPenalty;
   const memberId = newId();
+  const penaltyId = penalty > 0 ? newId() : null;
   const statements: Array<PreparedStatementBinding> = [
     db
       .prepare(
@@ -962,7 +1098,26 @@ teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
       )
       .bind("approved", now, request.id, memberId)
   ];
-  if (penalty > 0) {
+  if (penalty > 0 && penaltyId !== null) {
+    // The late-join penalty is a first-class penalty row (reason late_join)
+    // so organisers can waive it with an audit trail (§12.7).
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO penalties (id, participant_id, admin_user_id, seconds, reason, waived, created_at, updated_at, waived_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(
+          penaltyId,
+          participant.id,
+          auth.user.id,
+          penalty,
+          "late_join",
+          0,
+          now,
+          now,
+          null
+        )
+    );
     statements.push(
       db
         .prepare(
@@ -982,7 +1137,7 @@ teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
   if (affectedRows(results[1]) !== 1) {
     return errorResponse(c, "CONFLICT", "Join request already decided");
   }
-  if (penalty > 0 && affectedRows(results[2]) !== 1) {
+  if (penalty > 0 && (affectedRows(results[2]) !== 1 || affectedRows(results[3]) !== 1)) {
     return errorResponse(
       c,
       "INTERNAL",
@@ -998,7 +1153,8 @@ teamsRouter.post("/api/join-requests/:requestId/approve", async (c) => {
     },
     request: { id: request.id, status: "approved" },
     lateJoinPenaltyApplied: penalty > 0,
-    penaltySeconds: participant.penaltySeconds + penalty
+    penaltySeconds: participant.penaltySeconds + penalty,
+    penaltyId
   });
 });
 
@@ -1033,6 +1189,14 @@ teamsRouter.post("/api/join-requests/:requestId/reject", async (c) => {
   if (participant === null || participant.kind !== "team") {
     return errorResponse(c, "NOT_FOUND", "Team not found");
   }
+  const rejectEvent = await readEvent(db, participant.eventId);
+  if (rejectEvent === null) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const rejectGated = rosterGate(c, rejectEvent);
+  if (rejectGated !== null) {
+    return rejectGated;
+  }
   const approver = await readActiveMemberRow(
     db,
     participant.id,
@@ -1055,4 +1219,89 @@ teamsRouter.post("/api/join-requests/:requestId/reject", async (c) => {
     return errorResponse(c, "CONFLICT", "Join request already decided");
   }
   return c.json({ request: { id: request.id, status: "rejected" } });
+});
+
+const pendingRequestRowSchema = z.object({
+  id: z.string(),
+  requested_user_id: z.string(),
+  username: z.string(),
+  created_at: z.string()
+});
+
+teamsRouter.get("/api/events/:eventId/membership", async (c) => {
+  const params = eventIdParams.safeParse({
+    eventId: c.req.param("eventId")
+  });
+  if (params.success === false) {
+    return errorResponse(c, "VALIDATION_ERROR", "Invalid event id");
+  }
+  const auth = await requireVerifiedUser(c);
+  if (auth.ok === false) {
+    return auth.response;
+  }
+  const db = c.env.DB;
+  const event = await readEvent(db, params.data.eventId);
+  if (
+    event === null ||
+    event.status === "draft" ||
+    event.status === "testing" ||
+    event.status === "archived"
+  ) {
+    return errorResponse(c, "EVENT_NOT_FOUND", "Event not found");
+  }
+  const membership = await readActiveMembershipForUserEvent(
+    db,
+    auth.user.id,
+    event.id
+  );
+  if (membership === null) {
+    return c.json({ participant: null });
+  }
+  const participant = await readParticipant(db, membership.participantId);
+  if (participant === null) {
+    return errorResponse(c, "NOT_FOUND", "Participant not found");
+  }
+  const members = await readActiveMembers(db, participant.id);
+  const caller = members.find((member) => member.userId === auth.user.id);
+  const canManage = caller !== undefined && canManageMembers(caller.role);
+  let pendingRequests: Array<{
+    id: string;
+    userId: string;
+    username: string;
+    createdAt: string;
+  }> = [];
+  if (canManage) {
+    const raw = (await db
+      .prepare(
+        "SELECT t.id, t.requested_user_id, u.username AS username, t.created_at FROM team_invites AS t INNER JOIN users AS u ON u.id = t.requested_user_id WHERE t.participant_id = ? AND t.status = 'pending' AND t.requested_user_id IS NOT NULL ORDER BY t.created_at ASC"
+      )
+      .bind(participant.id)
+      .all()).results;
+    const parsed = z.array(pendingRequestRowSchema).safeParse(raw);
+    if (parsed.success) {
+      pendingRequests = parsed.data.map((row) => ({
+        id: row.id,
+        userId: row.requested_user_id,
+        username: row.username,
+        createdAt: row.created_at
+      }));
+    }
+  }
+  return c.json({
+    participant: {
+      id: participant.id,
+      eventId: participant.eventId,
+      type: participant.kind,
+      name: participant.name,
+      eventPoints: participant.eventPoints,
+      penaltySeconds: participant.penaltySeconds
+    },
+    members: members.map((member) => ({
+      userId: member.userId,
+      username: member.username,
+      role: member.role
+    })),
+    pendingRequests,
+    canManage
+  });
 });
