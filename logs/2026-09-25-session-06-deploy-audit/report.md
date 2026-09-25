@@ -197,3 +197,14 @@ Verification after fixes: typecheck 4/4, lint, build pass; tests 188/188
 applied locally and to the staging D1. `staging` branch and the staging
 Worker still carry the pre-fix build — redeploy approval needed before the
 fixes go live. Production untouched.
+
+## Redeploy of the fixes (same session, appended)
+
+- Merged `main` (4870741) into `staging` (fast-forward) and pushed.
+- Migrations: no-op (0003+0004 already on the staging D1).
+- `wrangler deploy --env staging`: version `1b5103e2`, live at the staging URL.
+- Live curl: `/api/health` 200, `/api/events` 200, penalties/reversal/
+  finalize/service-tokens/membership/state all correctly gated (401
+  unauthenticated; 404 on membership in the first seconds was edge
+  propagation, re-probe returned 401). Authenticated exercise still blocked
+  on the Clerk claims template (user-side).
