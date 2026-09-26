@@ -1,7 +1,21 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { ProgressBar } from "@astryxdesign/core/ProgressBar";
+import { RadioList, RadioListItem } from "@astryxdesign/core/RadioList";
+import { Section } from "@astryxdesign/core/Section";
+import { Skeleton } from "@astryxdesign/core/Skeleton";
+import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Text } from "@astryxdesign/core/Text";
+import { TextInput } from "@astryxdesign/core/TextInput";
+import { VStack } from "@astryxdesign/core/VStack";
+import { useAnnounce } from "@astryxdesign/core/hooks";
 import { ApiError, apiGet, submitWithIdempotency } from "../lib/api";
 
 type ObjectiveStatus = "locked" | "available" | "in_progress" | "completed";
@@ -177,6 +191,12 @@ function submitLabel(type: string): string {
   return "Submit answer";
 }
 
+function statusVariant(status: ObjectiveStatus): "success" | "accent" | "neutral" {
+  if (status === "completed") return "success";
+  if (status === "locked") return "neutral";
+  return "accent";
+}
+
 export default function ChallengeView() {
   const params = useParams();
   const challengeId = params["challengeId"] ?? "";
@@ -185,6 +205,8 @@ export default function ChallengeView() {
   const [submitState, setSubmitState] = useState<SubmitState>("idle");
   const [submitMessage, setSubmitMessage] = useState("");
   const [unlockedHints, setUnlockedHints] = useState<Record<string, string>>({});
+  const [armingHint, setArmingHint] = useState<string | null>(null);
+  const announce = useAnnounce();
 
   const challenge = useQuery({
     queryKey: ["challenges", challengeId],
@@ -192,8 +214,26 @@ export default function ChallengeView() {
     enabled: challengeId.length > 0
   });
 
+  useEffect(() => {
+    if (submitState === "success" && submitMessage.length > 0) {
+      announce(submitMessage, "polite");
+    } else if (submitState === "failure" && submitMessage.length > 0) {
+      announce(submitMessage, "assertive");
+    }
+  }, [submitState, submitMessage, announce]);
+
   async function refresh() {
     await challenge.refetch();
+  }
+
+  function reportSuccess(message: string) {
+    setSubmitState("success");
+    setSubmitMessage(message);
+  }
+
+  function reportFailure(error: unknown, fallback: string) {
+    setSubmitState("failure");
+    setSubmitMessage(error instanceof ApiError ? error.message : fallback);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>, objective: Objective) {
@@ -207,20 +247,23 @@ export default function ChallengeView() {
         { answer: answers[objective.key] ?? "" },
         isCompletion
       );
-      setSubmitState("success");
-      setSubmitMessage(
+      reportSuccess(
         `Accepted and saved (+${result.eventPointsAward} points, +${result.platformCreditsAward} credits).`
       );
       await refresh();
     } catch (error) {
-      setSubmitState("failure");
-      setSubmitMessage(error instanceof ApiError ? error.message : "Submission failed. Retry safely.");
+      reportFailure(error, "Submission failed. Retry safely.");
     }
   }
 
-  async function handleHint(objective: Objective, hintKey: string, costPoints: number) {
+  async function handleHint(objective: Objective, hintKey: string) {
     if (submitState === "pending") return;
-    if (!window.confirm(`Unlock this hint for ${costPoints} points?`)) return;
+    const armedKey = `${objective.key}:${hintKey}`;
+    if (armingHint !== armedKey) {
+      setArmingHint(armedKey);
+      return;
+    }
+    setArmingHint(null);
     setSubmitState("pending");
     setSubmitMessage("");
     try {
@@ -229,13 +272,11 @@ export default function ChallengeView() {
         {},
         isHintUnlock
       );
-      setUnlockedHints((current) => ({ ...current, [`${objective.key}:${hintKey}`]: result.text }));
-      setSubmitState("success");
-      setSubmitMessage(`Hint unlocked. Balance: ${result.eventPoints} points.`);
+      setUnlockedHints((current) => ({ ...current, [armedKey]: result.text }));
+      reportSuccess(`Hint unlocked. Balance: ${result.eventPoints} points.`);
       await refresh();
     } catch (error) {
-      setSubmitState("failure");
-      setSubmitMessage(error instanceof ApiError ? error.message : "Could not unlock the hint.");
+      reportFailure(error, "Could not unlock the hint.");
     }
   }
 
@@ -258,147 +299,202 @@ export default function ChallengeView() {
         { readings },
         isCompletion
       );
-      setSubmitState("success");
-      setSubmitMessage(
-        `Target reached and saved (+${result.eventPointsAward} points).`
-      );
+      reportSuccess(`Target reached and saved (+${result.eventPointsAward} points).`);
       await refresh();
     } catch (error) {
-      setSubmitState("failure");
       const message = error instanceof ApiError ? error.message : "Location verification failed.";
+      setSubmitState("failure");
       setSubmitMessage(
         `${message} If your device keeps failing, contact an organizer — they can verify you manually.`
       );
     }
   }
 
+  if (challenge.isPending) {
+    return (
+      <Layout
+        contentWidth={640}
+        content={
+          <LayoutContent>
+            <VStack gap={2}>
+              <Skeleton aria-label="Loading challenge…" />
+              <Skeleton />
+            </VStack>
+          </LayoutContent>
+        }
+      />
+    );
+  }
+
+  if (challenge.isError || !challenge.data) {
+    return (
+      <Layout
+        contentWidth={640}
+        content={
+          <LayoutContent>
+            <Banner
+              status="error"
+              title="Could not load this challenge"
+              description="Retry from the event centre."
+              collapsible={false}
+            />
+          </LayoutContent>
+        }
+      />
+    );
+  }
+
+  const data = challenge.data;
+  const doneCount = data.objectives.filter((objective) => objective.status === "completed").length;
+
   return (
-    <main aria-busy={challenge.isPending}>
-      {challenge.isPending ? <p role="status">Loading challenge…</p> : null}
-      {challenge.isError ? <p role="alert">Could not load this challenge. Retry from the event centre.</p> : null}
-      {challenge.data ? (
-        <>
-          <header>
-            <h1>{challenge.data.challenge.title}</h1>
-            {challenge.data.challenge.description ? <p>{challenge.data.challenge.description}</p> : null}
-            {challenge.data.completed ? <p role="status">Challenge complete. Nothing left to do here.</p> : null}
-          </header>
-          <section aria-label="Objectives">
-            <h2>Objectives</h2>
-            <ol className="stack">
-              {challenge.data.objectives.map((objective) => (
-                <li key={objective.key} className="card">
-                  <h3>{objective.prompt}</h3>
-                  <p className="muted">
-                    Status: {objective.status.replace("_", " ")} · Reward: {objective.reward.eventPoints} points,{" "}
-                    {objective.reward.platformCredits} credits
-                    {objective.required ? "" : " · Optional"}
-                  </p>
-                  {objective.status === "completed" ? (
-                    <>
-                      <p role="status">Completed and saved. Refreshing never loses this.</p>
-                      {objective.completionFact ? <p>{objective.completionFact}</p> : null}
-                    </>
-                  ) : null}
-                  {objective.status === "locked" ? <p>Unlock earlier objectives to reveal this one.</p> : null}
-                  {objective.requiresManual && objective.status !== "completed" && objective.status !== "locked" ? (
-                    <p className="muted">This objective needs an organizer to verify it. Find event staff for help.</p>
-                  ) : null}
-                  {(objective.status === "available" || objective.status === "in_progress") &&
-                  !objective.requiresManual ? (
-                    objective.type === "location" ? (
-                      <div>
-                        {objective.guidance?.text ? <p>{objective.guidance.text}</p> : null}
-                        {objective.guidance?.placeName ? (
-                          <p className="muted">Area: {objective.guidance.placeName}</p>
-                        ) : null}
-                        <button
-                          type="button"
-                          disabled={submitState === "pending"}
-                          aria-busy={submitState === "pending"}
-                          onClick={() => void handleLocation(objective)}
-                        >
-                          {submitState === "pending" ? "Verifying…" : "Verify location"}
-                        </button>
-                      </div>
-                    ) : (
-                      <form onSubmit={(event) => void handleSubmit(event, objective)}>
-                        {objective.choices && objective.choices.length > 0 ? (
-                          <fieldset>
-                            <legend>{objective.type === "decision" ? "Choose your route" : "Choose an answer"}</legend>
-                            {objective.choices.map((choice) => (
-                              <label key={choice.id} className="card-row">
-                                <input
-                                  type="radio"
-                                  name={`answer-${objective.key}`}
-                                  value={choice.id}
-                                  checked={answers[objective.key] === choice.id}
-                                  onChange={() =>
-                                    setAnswers((current) => ({ ...current, [objective.key]: choice.id }))
-                                  }
-                                />
-                                {choice.label}
-                              </label>
-                            ))}
-                          </fieldset>
-                        ) : (
-                          <>
-                            <label htmlFor={`answer-${objective.key}`}>Your answer</label>
-                            <input
-                              id={`answer-${objective.key}`}
-                              name={`answer-${objective.key}`}
-                              type="text"
-                              autoComplete="off"
-                              value={answers[objective.key] ?? ""}
-                              onChange={(event) =>
-                                setAnswers((current) => ({ ...current, [objective.key]: event.target.value }))
-                              }
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Section aria-label="Challenge overview">
+              <VStack gap={2}>
+                <Heading level={1}>{data.challenge.title}</Heading>
+                {data.challenge.description ? <Text>{data.challenge.description}</Text> : null}
+                <ProgressBar
+                  value={doneCount}
+                  max={Math.max(data.objectives.length, 1)}
+                  label={`${doneCount} of ${data.objectives.length} objectives complete`}
+                />
+                {data.completed ? (
+                  <Banner
+                    status="success"
+                    title="Challenge complete"
+                    description="Nothing left to do here."
+                    collapsible={false}
+                  />
+                ) : null}
+              </VStack>
+            </Section>
+
+            <Section aria-label="Objectives">
+              <VStack gap={3}>
+                <Heading level={2}>Objectives</Heading>
+                {data.objectives.map((objective) => (
+                  <Card key={objective.key}>
+                    <VStack gap={2}>
+                      <Heading level={3}>{objective.prompt}</Heading>
+                      <Text type="supporting">
+                        <StatusDot variant={statusVariant(objective.status)} label={objective.status.replace("_", " ")} />{" "}
+                        {objective.status.replace("_", " ")} · {objective.reward.eventPoints} points,{" "}
+                        {objective.reward.platformCredits} credits
+                        {objective.required ? "" : " · Optional"}
+                      </Text>
+                      {objective.status === "completed" ? (
+                        <Banner
+                          status="success"
+                          title="Completed and saved"
+                          description={objective.completionFact ?? "Refreshing never loses this."}
+                          collapsible={false}
+                        />
+                      ) : null}
+                      {objective.status === "locked" ? (
+                        <Text>Unlock earlier objectives to reveal this one.</Text>
+                      ) : null}
+                      {objective.requiresManual &&
+                      objective.status !== "completed" &&
+                      objective.status !== "locked" ? (
+                        <Text color="secondary">
+                          This objective needs an organizer to verify it. Find event staff for help.
+                        </Text>
+                      ) : null}
+                      {(objective.status === "available" || objective.status === "in_progress") &&
+                      !objective.requiresManual ? (
+                        objective.type === "location" ? (
+                          <VStack gap={2}>
+                            {objective.guidance?.text ? <Text>{objective.guidance.text}</Text> : null}
+                            {objective.guidance?.placeName ? (
+                              <Text color="secondary">Area: {objective.guidance.placeName}</Text>
+                            ) : null}
+                            <Button
+                              label={submitState === "pending" ? "Verifying…" : "Verify location"}
+                              variant="primary"
+                              isLoading={submitState === "pending"}
+                              onClick={() => void handleLocation(objective)}
+                              width="100%"
                             />
-                          </>
-                        )}
-                        {objective.attemptsLeft !== undefined ? (
-                          <p className="muted" role="status">
-                            {objective.attemptsLeft} attempts left.
-                          </p>
-                        ) : null}
-                        <button type="submit" disabled={submitState === "pending"} aria-busy={submitState === "pending"}>
-                          {submitState === "pending" ? "Submitting…" : submitLabel(objective.type)}
-                        </button>
-                      </form>
-                    )
-                  ) : null}
-                  {objective.hints.length > 0 && objective.status !== "completed" ? (
-                    <div>
-                      <h4>Hints</h4>
-                      <ul className="stack">
-                        {objective.hints.map((hint) => (
-                          <li key={hint.key}>
-                            {hint.unlocked || unlockedHints[`${objective.key}:${hint.key}`] ? (
-                              <p>{unlockedHints[`${objective.key}:${hint.key}`] ?? "Unlocked."}</p>
-                            ) : (
-                              <button
-                                type="button"
-                                disabled={submitState === "pending"}
-                                onClick={() => void handleHint(objective, hint.key, hint.costPoints)}
+                          </VStack>
+                        ) : (
+                          <form onSubmit={(event) => void handleSubmit(event, objective)}>
+                            {objective.choices && objective.choices.length > 0 ? (
+                              <RadioList
+                                label={objective.type === "decision" ? "Choose your route" : "Choose an answer"}
+                                value={answers[objective.key] ?? ""}
+                                onChange={(value) =>
+                                  setAnswers((current) => ({ ...current, [objective.key]: value }))
+                                }
                               >
-                                Unlock hint ({hint.costPoints} points)
-                              </button>
+                                {objective.choices.map((choice) => (
+                                  <RadioListItem key={choice.id} value={choice.id} label={choice.label} />
+                                ))}
+                              </RadioList>
+                            ) : (
+                              <TextInput
+                                label="Your answer"
+                                value={answers[objective.key] ?? ""}
+                                onChange={(value) =>
+                                  setAnswers((current) => ({ ...current, [objective.key]: value }))
+                                }
+                                autoComplete="off"
+                                {...(objective.attemptsLeft !== undefined
+                                  ? { description: `${objective.attemptsLeft} attempts left.` }
+                                  : {})}
+                              />
                             )}
-                          </li>
-                        ))}
-                      </ul>
-                    </div>
-                  ) : null}
-                </li>
-              ))}
-            </ol>
-            <div aria-live="polite">
-              {submitState === "success" ? <p role="status">{submitMessage}</p> : null}
-              {submitState === "failure" ? <p role="alert">{submitMessage}</p> : null}
-            </div>
-          </section>
-        </>
-      ) : null}
-    </main>
+                            <Button
+                              label={submitState === "pending" ? "Submitting…" : submitLabel(objective.type)}
+                              variant="primary"
+                              type="submit"
+                              isLoading={submitState === "pending"}
+                              width="100%"
+                            />
+                          </form>
+                        )
+                      ) : null}
+                      {objective.hints.length > 0 && objective.status !== "completed" ? (
+                        <VStack gap={2}>
+                          <Heading level={4}>Hints</Heading>
+                          {objective.hints.map((hint) => (
+                            <VStack key={hint.key} gap={2}>
+                              {hint.unlocked || unlockedHints[`${objective.key}:${hint.key}`] ? (
+                                <Text>{unlockedHints[`${objective.key}:${hint.key}`] ?? "Unlocked."}</Text>
+                              ) : (
+                                <Button
+                                  label={
+                                    armingHint === `${objective.key}:${hint.key}`
+                                      ? `Confirm: spend ${hint.costPoints} points?`
+                                      : `Unlock hint (${hint.costPoints} points)`
+                                  }
+                                  variant="secondary"
+                                  isLoading={submitState === "pending"}
+                                  onClick={() => void handleHint(objective, hint.key)}
+                                  width="100%"
+                                />
+                              )}
+                            </VStack>
+                          ))}
+                        </VStack>
+                      ) : null}
+                    </VStack>
+                  </Card>
+                ))}
+                {submitState === "success" ? (
+                  <Banner status="success" title="Saved" description={submitMessage} collapsible={false} />
+                ) : null}
+                {submitState === "failure" ? (
+                  <Banner status="error" title="Something went wrong" description={submitMessage} collapsible={false} />
+                ) : null}
+              </VStack>
+            </Section>
+          </VStack>
+        </LayoutContent>
+      }
+    />
   );
 }

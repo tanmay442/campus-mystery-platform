@@ -1,6 +1,16 @@
 /** How-it-works guide; requires Clerk sign-in. */
 import { useAuth } from "@clerk/react";
-import { Link, Navigate } from "react-router";
+import { Navigate } from "react-router";
+import { Button } from "@astryxdesign/core/Button";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { List, ListItem } from "@astryxdesign/core/List";
+import { Section } from "@astryxdesign/core/Section";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import { Text } from "@astryxdesign/core/Text";
+import { HStack } from "@astryxdesign/core/HStack";
+import { VStack } from "@astryxdesign/core/VStack";
+import RouterLink from "../components/RouterLink";
 
 const CARDS = [
   {
@@ -37,11 +47,7 @@ export default function Onboarding() {
   const { isLoaded, isSignedIn } = useAuth();
 
   if (!isLoaded) {
-    return (
-      <main>
-        <p role="status">Loading…</p>
-      </main>
-    );
+    return <Spinner label="Loading…" />;
   }
 
   if (!isSignedIn) {
@@ -49,34 +55,43 @@ export default function Onboarding() {
   }
 
   return (
-    <main>
-      <h1>How it works</h1>
-      <p>
-        Skipped it before? <Link to="/">Back to the start</Link> whenever you like.
-      </p>
-      <ol className="onboarding-cards">
-        {CARDS.map((card) => (
-          <li key={card.title} className="card">
-            <h2>{card.title}</h2>
-            <p>{card.body}</p>
-          </li>
-        ))}
-      </ol>
-      <section aria-label="Location permission">
-        <h2>About location access</h2>
-        <p>
-          Location permission is requested just in time, when you open your first location objective. It is never asked
-          for on the landing page.
-        </p>
-      </section>
-      <div className="actions">
-        <Link className="button button-primary" to="/login">
-          Continue to sign in
-        </Link>
-        <Link className="button" to="/">
-          Skip for now
-        </Link>
-      </div>
-    </main>
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Section aria-label="How it works">
+              <VStack gap={2}>
+                <Heading level={1}>How it works</Heading>
+                <Text>
+                  Skipped it before? <RouterLink href="/">Back to the start</RouterLink> whenever you like.
+                </Text>
+                <List
+                  header={<Heading level={2}>The rules of play</Heading>}
+                  hasDividers
+                >
+                  {CARDS.map((card) => (
+                    <ListItem key={card.title} label={card.title} description={card.body} />
+                  ))}
+                </List>
+              </VStack>
+            </Section>
+            <Section aria-label="Location permission">
+              <VStack gap={2}>
+                <Heading level={2}>About location access</Heading>
+                <Text>
+                  Location permission is requested just in time, when you open your first location objective. It is
+                  never asked for on the landing page.
+                </Text>
+                <HStack gap={2}>
+                  <Button label="Continue to sign in" variant="primary" href="/login" as={RouterLink} />
+                  <Button label="Skip for now" variant="secondary" href="/" as={RouterLink} />
+                </HStack>
+              </VStack>
+            </Section>
+          </VStack>
+        </LayoutContent>
+      }
+    />
   );
 }

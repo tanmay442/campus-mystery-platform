@@ -1,8 +1,22 @@
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@clerk/react";
-import { Link, Navigate, useParams } from "react-router";
-import ChallengeCard from "../components/ChallengeCard";
-import type { ChallengeStatus } from "../components/ChallengeCard";
+import { Navigate, useParams } from "react-router";
+import { Badge } from "@astryxdesign/core/Badge";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { List, ListItem } from "@astryxdesign/core/List";
+import { Section } from "@astryxdesign/core/Section";
+import { Skeleton } from "@astryxdesign/core/Skeleton";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Text } from "@astryxdesign/core/Text";
+import { HStack } from "@astryxdesign/core/HStack";
+import { VStack } from "@astryxdesign/core/VStack";
+import RouterLink from "../components/RouterLink";
 import Countdown from "../components/Countdown";
 import { apiGet } from "../lib/api";
 
@@ -102,12 +116,6 @@ function isCredits(value: unknown): value is Credits {
   return isRecord(value) && typeof value["balance"] === "number";
 }
 
-function challengeStatus(challenge: StateChallenge, completed: boolean): ChallengeStatus {
-  if (completed) return "completed";
-  if (challenge.locked) return "locked";
-  return "available";
-}
-
 export default function EventCentre() {
   const { isLoaded, isSignedIn } = useAuth();
   const params = useParams();
@@ -128,103 +136,171 @@ export default function EventCentre() {
   });
 
   if (!isLoaded) {
-    return (
-      <main>
-        <p role="status">Loading…</p>
-      </main>
-    );
+    return <Spinner label="Loading…" />;
   }
 
   if (!isSignedIn) {
     return <Navigate to="/login" replace />;
   }
 
+  if (state.isPending) {
+    return (
+      <Layout
+        contentWidth={640}
+        content={
+          <LayoutContent>
+            <VStack gap={2}>
+              <Skeleton aria-label="Loading event centre…" />
+              <Skeleton />
+              <Skeleton />
+            </VStack>
+          </LayoutContent>
+        }
+      />
+    );
+  }
+
+  if (state.isError || !state.data) {
+    return (
+      <Layout
+        contentWidth={640}
+        content={
+          <LayoutContent>
+            <Banner
+              status="error"
+              title="Could not load this event"
+              description="Check your connection and retry."
+              collapsible={false}
+            />
+          </LayoutContent>
+        }
+      />
+    );
+  }
+
+  const data = state.data;
+  const isLive = data.event.status === "live";
+
   return (
-    <main aria-busy={state.isPending}>
-      {state.isPending ? <p role="status">Loading event centre…</p> : null}
-      {state.isError ? (
-        <p role="alert">Could not load this event. Check your connection and retry.</p>
-      ) : null}
-      {state.data ? (
-        <>
-          <header>
-            <p className="eyebrow">{state.data.event.status === "live" ? "Live now" : state.data.event.status}</p>
-            <h1>{state.data.event.name}</h1>
-            {state.data.event.description ? <p>{state.data.event.description}</p> : null}
-            {state.data.event.endsAt ? <Countdown targetIso={state.data.event.endsAt} label="Ends in" /> : null}
-            {state.data.event.startsAt && !state.data.event.endsAt ? (
-              <Countdown targetIso={state.data.event.startsAt} label="Starts in" />
-            ) : null}
-          </header>
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Section aria-label="Event overview">
+              <VStack gap={2}>
+                <HStack gap={2}>
+                  <StatusDot
+                    variant={isLive ? "success" : "neutral"}
+                    label={isLive ? "Live now" : data.event.status}
+                    isPulsing={isLive}
+                  />
+                  <Text type="supporting">{data.event.status}</Text>
+                </HStack>
+                <Heading level={1}>{data.event.name}</Heading>
+                {data.event.description ? <Text>{data.event.description}</Text> : null}
+                {data.event.endsAt ? <Countdown targetIso={data.event.endsAt} label="Ends in" /> : null}
+                {data.event.startsAt && !data.event.endsAt ? (
+                  <Countdown targetIso={data.event.startsAt} label="Starts in" />
+                ) : null}
+              </VStack>
+            </Section>
 
-          <section aria-label="Participant">
-            <h2>Playing as</h2>
-            <p>{state.data.participant?.name ?? "Not registered yet"}</p>
-            {state.data.participant?.completedAt ? (
-              <p role="status">Event complete. Official time was set by the server.</p>
-            ) : null}
-          </section>
+            <Section aria-label="Participant">
+              <VStack gap={2}>
+                <Heading level={2}>Playing as</Heading>
+                <Text weight="medium">{data.participant?.name ?? "Not registered yet"}</Text>
+                {data.participant?.completedAt ? (
+                  <Banner
+                    status="success"
+                    title="Event complete"
+                    description="Official time was set by the server."
+                    collapsible={false}
+                  />
+                ) : null}
+              </VStack>
+            </Section>
 
-          <section aria-label="Score">
-            <h2>Score</h2>
-            <p>
-              {state.data.participant?.eventPoints ?? 0} event points ·{" "}
-              {credits.data?.balance ?? 0} credits · {state.data.counts.participants} participants
-            </p>
-            <Link className="button" to={`/events/${eventId}/leaderboard`}>
-              View leaderboard
-            </Link>
-          </section>
+            <Section aria-label="Score">
+              <Card>
+                <VStack gap={2}>
+                  <Heading level={2}>Score</Heading>
+                  <HStack gap={2}>
+                    <Text weight="semibold">{data.participant?.eventPoints ?? 0} event points</Text>
+                    <Text color="secondary">{credits.data?.balance ?? 0} credits</Text>
+                    <Badge label={`${data.counts.participants} players`} />
+                  </HStack>
+                  <Button
+                    label="View leaderboard"
+                    variant="secondary"
+                    href={`/events/${eventId}/leaderboard`}
+                    as={RouterLink}
+                    width="100%"
+                  />
+                </VStack>
+              </Card>
+            </Section>
 
-          <section aria-label="Challenges">
-            <h2>Challenges</h2>
-            {state.data.challenges.length === 0 ? <p>No challenges are available yet.</p> : null}
-            <ul className="stack">
-              {state.data.challenges.map((challenge) => (
-                <li key={challenge.id}>
-                  {challenge.locked ? (
-                    <ChallengeCard
-                      title={challenge.title}
-                      narrative="Unlock earlier challenges to reveal this one."
-                      status={challengeStatus(challenge, false)}
-                      points={0}
-                      lockedReason="Complete the previous steps first."
-                    />
-                  ) : (
-                    <Link to={`/events/${eventId}/challenges/${challenge.id}`} aria-label={`Open ${challenge.title}`}>
-                      <ChallengeCard
-                        title={challenge.title}
-                        narrative={challenge.description ?? "Open to see the objectives."}
-                        status={challengeStatus(challenge, false)}
-                        points={state.data.participant?.eventPoints ?? 0}
+            <Section aria-label="Challenges">
+              <VStack gap={2}>
+                <Heading level={2}>Challenges</Heading>
+                {data.challenges.length === 0 ? (
+                  <EmptyState
+                    title="No challenges yet"
+                    description="No challenges are available yet. Check back after the event starts."
+                  />
+                ) : (
+                  <List header={<Text type="label">Tap an unlocked challenge to open it</Text>} hasDividers>
+                    {data.challenges.map((challenge) => (
+                      <ListItem
+                        key={challenge.id}
+                        label={challenge.title}
+                        description={
+                          challenge.locked
+                            ? "Locked — complete the previous steps first."
+                            : (challenge.description ?? "Open to see the objectives.")
+                        }
+                        startContent={
+                          <StatusDot
+                            variant={challenge.locked ? "neutral" : "accent"}
+                            label={challenge.locked ? "Locked" : "Available"}
+                          />
+                        }
+                        {...(challenge.locked
+                          ? {}
+                          : { href: `/events/${eventId}/challenges/${challenge.id}` })}
                       />
-                    </Link>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </section>
+                    ))}
+                  </List>
+                )}
+              </VStack>
+            </Section>
 
-          <section aria-label="Announcements">
-            <h2>Announcements</h2>
-            {state.data.announcements.length === 0 ? <p>No announcements yet.</p> : null}
-            <ul className="stack">
-              {state.data.announcements.map((item) => (
-                <li key={item.id} className="card">
-                  <h3>{item.title}</h3>
-                  <p>{item.body}</p>
-                </li>
-              ))}
-            </ul>
-          </section>
+            <Section aria-label="Announcements">
+              <VStack gap={2}>
+                <Heading level={2}>Announcements</Heading>
+                {data.announcements.length === 0 ? (
+                  <EmptyState
+                    title="No announcements"
+                    description="Organizers have not posted anything yet."
+                    isCompact
+                  />
+                ) : (
+                  <List hasDividers>
+                    {data.announcements.map((item) => (
+                      <ListItem key={item.id} label={item.title} description={item.body} />
+                    ))}
+                  </List>
+                )}
+              </VStack>
+            </Section>
 
-          <nav aria-label="Event">
-            <Link className="button" to={`/events/${eventId}/team`}>
-              Team
-            </Link>
-          </nav>
-        </>
-      ) : null}
-    </main>
+            <Section aria-label="Event">
+              <Button label="Team" variant="secondary" href={`/events/${eventId}/team`} as={RouterLink} width="100%" />
+            </Section>
+          </VStack>
+        </LayoutContent>
+      }
+    />
   );
 }

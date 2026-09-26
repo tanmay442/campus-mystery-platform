@@ -1,5 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "react-router";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { Section } from "@astryxdesign/core/Section";
+import { Skeleton } from "@astryxdesign/core/Skeleton";
+import { Text } from "@astryxdesign/core/Text";
+import { VStack } from "@astryxdesign/core/VStack";
+import { Banner } from "@astryxdesign/core/Banner";
+import RouterLink from "../components/RouterLink";
 import Countdown from "../components/Countdown";
 import { apiGet } from "../lib/api";
 
@@ -38,40 +48,69 @@ export default function Landing() {
   const event = promoted.data?.events[0] ?? null;
 
   return (
-    <main>
-      <header className="hero">
-        <p className="eyebrow">Campus Mystery</p>
-        <h1>Turn the campus into a game board</h1>
-        <p>
-          Solve puzzles, follow signals to real locations, and race other players and teams to finish first. Solo or in
-          teams of up to five.
-        </p>
-        <div className="actions">
-          <Link className="button button-primary" to="/login">
-            Sign in to play
-          </Link>
-          <Link className="button" to="/onboarding">
-            How it works
-          </Link>
-        </div>
-      </header>
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Section aria-label="Campus Mystery intro">
+              <VStack gap={2}>
+                <Text type="label" color="secondary">
+                  Campus Mystery
+                </Text>
+                <Heading level={1} type="display-2">
+                  Turn the campus into a game board
+                </Heading>
+                <Text>
+                  Solve puzzles, follow signals to real locations, and race other players and teams to finish
+                  first. Solo or in teams of up to five.
+                </Text>
+                <VStack gap={2}>
+                  <Button label="Sign in to play" variant="primary" href="/login" as={RouterLink} width="100%" />
+                  <Button label="How it works" variant="secondary" href="/onboarding" as={RouterLink} width="100%" />
+                </VStack>
+              </VStack>
+            </Section>
 
-      <section aria-label="Promoted event" aria-busy={promoted.isPending}>
-        <h2>Featured event</h2>
-        {promoted.isPending ? <p role="status">Loading the featured event…</p> : null}
-        {promoted.isError ? <p role="alert">Could not load the featured event. Pull to refresh and retry.</p> : null}
-        {promoted.isSuccess && event === null ? <p>No event is promoted right now. Check back soon.</p> : null}
-        {event ? (
-          <article className="card">
-            <h3>{event.name}</h3>
-            {event.description ? <p>{event.description}</p> : null}
-            {event.startsAt ? <Countdown targetIso={event.startsAt} label="Starts in" /> : null}
-            <Link className="button button-primary" to={`/events/${event.id}`}>
-              Open event centre
-            </Link>
-          </article>
-        ) : null}
-      </section>
-    </main>
+            <Section aria-label="Promoted event">
+              <VStack gap={2}>
+                <Heading level={2}>Featured event</Heading>
+                {promoted.isPending ? <Skeleton aria-label="Loading the featured event…" /> : null}
+                {promoted.isError ? (
+                  <Banner
+                    status="error"
+                    title="Could not load the featured event"
+                    description="Check your connection and retry."
+                    collapsible={false}
+                  />
+                ) : null}
+                {promoted.isSuccess && event === null ? (
+                  <EmptyState
+                    title="No event right now"
+                    description="No event is promoted right now. Check back soon."
+                  />
+                ) : null}
+                {event ? (
+                  <Card>
+                    <VStack gap={2}>
+                      <Heading level={3}>{event.name}</Heading>
+                      {event.description ? <Text>{event.description}</Text> : null}
+                      {event.startsAt ? <Countdown targetIso={event.startsAt} label="Starts in" /> : null}
+                      <Button
+                        label="Open event centre"
+                        variant="primary"
+                        href={`/events/${event.id}`}
+                        as={RouterLink}
+                        width="100%"
+                      />
+                    </VStack>
+                  </Card>
+                ) : null}
+              </VStack>
+            </Section>
+          </VStack>
+        </LayoutContent>
+      }
+    />
   );
 }

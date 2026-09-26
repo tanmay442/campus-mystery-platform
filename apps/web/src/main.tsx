@@ -1,11 +1,14 @@
-/** App entry: Clerk auth provider wrapping the query client and router. */
+/** App entry: Astryx theme + CSS, Clerk auth provider, query client, router. */
 import { ClerkProvider } from "@clerk/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { RouterProvider } from "react-router";
+import { Theme } from "@astryxdesign/core";
+import "@astryxdesign/core/reset.css";
+import "@astryxdesign/core/astryx.css";
 import { router } from "./router";
-import "./styles.css";
+import { neutralTheme } from "./themes/neutral/neutralTheme";
 
 declare global {
   interface Window {
@@ -45,11 +48,13 @@ if (rootElement) {
   } else {
     createRoot(rootElement).render(
       <StrictMode>
-        <ClerkProvider publishableKey={publishableKey}>
-          <QueryClientProvider client={queryClient}>
-            <RouterProvider router={router} />
-          </QueryClientProvider>
-        </ClerkProvider>
+        <Theme theme={neutralTheme} mode="system">
+          <ClerkProvider publishableKey={publishableKey}>
+            <QueryClientProvider client={queryClient}>
+              <RouterProvider router={router} />
+            </QueryClientProvider>
+          </ClerkProvider>
+        </Theme>
       </StrictMode>
     );
   }

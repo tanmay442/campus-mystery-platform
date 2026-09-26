@@ -1,16 +1,21 @@
-import { Link } from "react-router";
+import { Button } from "@astryxdesign/core/Button";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Section } from "@astryxdesign/core/Section";
+import { Text } from "@astryxdesign/core/Text";
+import { VStack } from "@astryxdesign/core/VStack";
+import RouterLink from "../../components/RouterLink";
 
 export default function AdminDashboard() {
   return (
-    <section aria-label="Admin dashboard">
-      <h2>Dashboard</h2>
-      <p className="muted">
-        Live counts, events needing attention, and quick actions land here in Phase 2. Every action is enforced and
-        audited on the server.
-      </p>
-      <Link className="button button-primary" to="/admin/events">
-        Manage events
-      </Link>
-    </section>
+    <Section aria-label="Admin dashboard">
+      <VStack gap={2}>
+        <Heading level={2}>Dashboard</Heading>
+        <Text color="secondary">
+          Live counts, events needing attention, and quick actions land here in Phase 2. Every action is enforced and
+          audited on the server.
+        </Text>
+        <Button label="Manage events" variant="primary" href="/admin/events" as={RouterLink} width="100%" />
+      </VStack>
+    </Section>
   );
 }

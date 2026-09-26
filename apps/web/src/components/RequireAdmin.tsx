@@ -1,5 +1,7 @@
-import type { ReactNode } from "react";
 import { Navigate } from "react-router";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import type { ReactNode } from "react";
 import { useAdminFlag, useSession } from "../lib/session";
 
 interface RequireAdminProps {
@@ -11,7 +13,7 @@ export default function RequireAdmin({ children }: RequireAdminProps) {
   const isAdmin = useAdminFlag();
 
   if (session.isPending) {
-    return <p role="status">Checking access…</p>;
+    return <Spinner label="Checking access…" />;
   }
 
   if (session.isError || !session.data) {
@@ -20,10 +22,12 @@ export default function RequireAdmin({ children }: RequireAdminProps) {
 
   if (!isAdmin) {
     return (
-      <main>
-        <h1>Not authorized</h1>
-        <p>This area is reserved for event organizers. Access is verified on the server.</p>
-      </main>
+      <Banner
+        status="error"
+        title="Not authorized"
+        description="This area is reserved for event organizers. Access is verified on the server."
+        collapsible={false}
+      />
     );
   }
 

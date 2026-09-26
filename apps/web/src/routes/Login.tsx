@@ -3,6 +3,14 @@ import { useEffect, useRef, useState } from "react";
 import { SignIn, useAuth } from "@clerk/react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Navigate } from "react-router";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { Section } from "@astryxdesign/core/Section";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import { Text } from "@astryxdesign/core/Text";
+import { VStack } from "@astryxdesign/core/VStack";
+import { useAnnounce } from "@astryxdesign/core/hooks";
 import { ApiError } from "../lib/api";
 import { exchangeClerkSession } from "../lib/session";
 
@@ -14,6 +22,7 @@ export default function Login() {
   const [state, setState] = useState<ExchangeState>("idle");
   const [message, setMessage] = useState("");
   const attempted = useRef(false);
+  const announce = useAnnounce();
 
   useEffect(() => {
     if (!isLoaded || !isSignedIn || attempted.current) return;
@@ -32,20 +41,31 @@ export default function Login() {
     );
   }, [isLoaded, isSignedIn, getToken, queryClient]);
 
+  useEffect(() => {
+    if (state === "failure" && message.length > 0) {
+      announce(message, "assertive");
+    }
+  }, [state, message, announce]);
+
   if (!isLoaded) {
-    return (
-      <main>
-        <p role="status">Loading sign-in…</p>
-      </main>
-    );
+    return <Spinner label="Loading sign-in…" />;
   }
 
   if (!isSignedIn) {
     return (
-      <main>
-        <h1>Sign in</h1>
-        <SignIn forceRedirectUrl="/login" />
-      </main>
+      <Layout
+        contentWidth={640}
+        content={
+          <LayoutContent>
+            <Section aria-label="Sign in">
+              <VStack gap={2}>
+                <Heading level={1}>Sign in</Heading>
+                <SignIn forceRedirectUrl="/login" />
+              </VStack>
+            </Section>
+          </LayoutContent>
+        }
+      />
     );
   }
 
@@ -54,13 +74,22 @@ export default function Login() {
   }
 
   return (
-    <main>
-      <h1>Sign in</h1>
-      <div aria-live="polite">
-        {state === "idle" ? <p role="status">Preparing your session…</p> : null}
-        {state === "pending" ? <p role="status">Finishing sign-in…</p> : null}
-        {state === "failure" ? <p role="alert">{message}</p> : null}
-      </div>
-    </main>
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <Section aria-label="Sign in progress">
+            <VStack gap={2}>
+              <Heading level={1}>Sign in</Heading>
+              {state === "idle" ? <Text>Preparing your session…</Text> : null}
+              {state === "pending" ? <Spinner label="Finishing sign-in…" /> : null}
+              {state === "failure" ? (
+                <Banner status="error" title="Sign-in failed" description={message} collapsible={false} />
+              ) : null}
+            </VStack>
+          </Section>
+        </LayoutContent>
+      }
+    />
   );
 }

@@ -1,3 +1,9 @@
+import { Card } from "@astryxdesign/core/Card";
+import { Heading } from "@astryxdesign/core/Heading";
+import { StatusDot } from "@astryxdesign/core/StatusDot";
+import { Text } from "@astryxdesign/core/Text";
+import { VStack } from "@astryxdesign/core/VStack";
+
 export type ProximityBand =
   | "Signal extremely weak"
   | "Signal weak"
@@ -13,28 +19,30 @@ interface TargetSignalProps {
   hint: string;
 }
 
+function bandVariant(band: ProximityBand): "success" | "accent" | "warning" | "neutral" {
+  if (band === "Target reached") return "success";
+  if (band === "Signal strong" || band === "Signal improving") return "accent";
+  if (band === "Signal detected") return "warning";
+  return "neutral";
+}
+
 export default function TargetSignal({ bearingLabel, band, accuracyMeters, hint }: TargetSignalProps) {
   return (
-    <section className="target-signal" aria-label="Target signal">
-      <h2 className="target-signal-heading">TARGET SIGNAL</h2>
-      <dl className="target-signal-facts">
-        <div className="target-signal-row">
-          <dt>Direction:</dt>
-          <dd>{bearingLabel}</dd>
-        </div>
-        <div className="target-signal-row">
-          <dt>Proximity:</dt>
-          <dd>{band}</dd>
-        </div>
-        <div className="target-signal-row">
-          <dt>Location accuracy:</dt>
-          <dd>+/- {accuracyMeters} m</dd>
-        </div>
-      </dl>
-      <div className="target-signal-hint">
-        <p className="target-signal-hint-label">Hint:</p>
-        <p className="target-signal-hint-text">{hint}</p>
-      </div>
-    </section>
+    <Card>
+      <VStack gap={2}>
+        <Heading level={4}>Target signal</Heading>
+        <Text>
+          <StatusDot variant={bandVariant(band)} label={band} isPulsing={band === "Target reached"} /> Direction:{" "}
+          {bearingLabel}
+        </Text>
+        <Text>
+          Proximity: <Text weight="semibold">{band}</Text>
+        </Text>
+        <Text color="secondary">Location accuracy: +/- {accuracyMeters} m</Text>
+        <Text>
+          <Text weight="semibold">Hint:</Text> {hint}
+        </Text>
+      </VStack>
+    </Card>
   );
 }

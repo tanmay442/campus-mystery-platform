@@ -1,6 +1,8 @@
 import { Suspense, lazy } from "react";
 import type { ReactNode } from "react";
 import { createBrowserRouter } from "react-router";
+import { Spinner } from "@astryxdesign/core/Spinner";
+import AppFrame from "./components/AppFrame";
 import RequireAdmin from "./components/RequireAdmin";
 import EventCentre from "./routes/EventCentre";
 import Landing from "./routes/Landing";
@@ -15,7 +17,7 @@ const AdminDashboard = lazy(() => import("./routes/admin/AdminDashboard"));
 const AdminEvents = lazy(() => import("./routes/admin/AdminEvents"));
 
 function suspended(node: ReactNode) {
-  return <Suspense fallback={<p role="status">Loading…</p>}>{node}</Suspense>;
+  return <Suspense fallback={<Spinner label="Loading…" />}>{node}</Suspense>;
 }
 
 function admin(node: ReactNode) {
@@ -23,19 +25,24 @@ function admin(node: ReactNode) {
 }
 
 export const router = createBrowserRouter([
-  { path: "/", element: <Landing /> },
-  { path: "/login", element: <Login /> },
-  { path: "/onboarding", element: <Onboarding /> },
-  { path: "/events/:eventId", element: <EventCentre /> },
-  { path: "/events/:eventId/challenges/:challengeId", element: suspended(<ChallengeView />) },
-  { path: "/events/:eventId/leaderboard", element: <LeaderboardPage /> },
-  { path: "/events/:eventId/team", element: <TeamPage /> },
   {
-    path: "/admin",
-    element: admin(<AdminLayout />),
+    element: <AppFrame />,
     children: [
-      { index: true, element: suspended(<AdminDashboard />) },
-      { path: "events", element: suspended(<AdminEvents />) }
+      { path: "/", element: <Landing /> },
+      { path: "/login", element: <Login /> },
+      { path: "/onboarding", element: <Onboarding /> },
+      { path: "/events/:eventId", element: <EventCentre /> },
+      { path: "/events/:eventId/challenges/:challengeId", element: suspended(<ChallengeView />) },
+      { path: "/events/:eventId/leaderboard", element: <LeaderboardPage /> },
+      { path: "/events/:eventId/team", element: <TeamPage /> },
+      {
+        path: "/admin",
+        element: admin(<AdminLayout />),
+        children: [
+          { index: true, element: suspended(<AdminDashboard />) },
+          { path: "events", element: suspended(<AdminEvents />) }
+        ]
+      }
     ]
   }
 ]);

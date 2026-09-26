@@ -1,8 +1,24 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useAuth } from "@clerk/react";
 import { Navigate, useParams } from "react-router";
+import { Avatar } from "@astryxdesign/core/Avatar";
+import { AvatarGroup } from "@astryxdesign/core/AvatarGroup";
+import { Banner } from "@astryxdesign/core/Banner";
+import { Button } from "@astryxdesign/core/Button";
+import { Card } from "@astryxdesign/core/Card";
+import { EmptyState } from "@astryxdesign/core/EmptyState";
+import { FormLayout } from "@astryxdesign/core/FormLayout";
+import { Heading } from "@astryxdesign/core/Heading";
+import { Layout, LayoutContent } from "@astryxdesign/core/Layout";
+import { List, ListItem } from "@astryxdesign/core/List";
+import { Section } from "@astryxdesign/core/Section";
+import { Skeleton } from "@astryxdesign/core/Skeleton";
+import { Text } from "@astryxdesign/core/Text";
+import { TextInput } from "@astryxdesign/core/TextInput";
+import { VStack } from "@astryxdesign/core/VStack";
+import { useAnnounce } from "@astryxdesign/core/hooks";
 import { ApiError, apiGet, apiPost, submitWithIdempotency } from "../lib/api";
 
 interface Member {
@@ -73,7 +89,9 @@ function isMembership(value: unknown): value is Membership {
   );
 }
 
-function normalizeMembership(value: Membership): Required<Omit<Membership, "participant">> & Pick<Membership, "participant"> {
+function normalizeMembership(
+  value: Membership
+): Required<Omit<Membership, "participant">> & Pick<Membership, "participant"> {
   return {
     participant: value.participant,
     members: value.members ?? [],
@@ -103,6 +121,7 @@ export default function TeamPage() {
   const [state, setState] = useState<SubmitState>("idle");
   const [message, setMessage] = useState("");
   const [inviteToken, setInviteToken] = useState<string | null>(null);
+  const announce = useAnnounce();
 
   const team = useQuery({
     queryKey: ["events", eventId, "membership"],
@@ -111,12 +130,14 @@ export default function TeamPage() {
     enabled: eventId.length > 0 && isSignedIn === true
   });
 
+  useEffect(() => {
+    if ((state === "success" || state === "failure") && message.length > 0) {
+      announce(message, state === "failure" ? "assertive" : "polite");
+    }
+  }, [state, message, announce]);
+
   if (!isLoaded) {
-    return (
-      <main>
-        <p role="status">Loading…</p>
-      </main>
-    );
+    return <Skeleton aria-label="Loading…" />;
   }
 
   if (!isSignedIn) {
@@ -152,168 +173,226 @@ export default function TeamPage() {
   }
 
   const participantId = team.data?.participant?.id;
+  const showCreateForm =
+    team.data !== undefined &&
+    (team.data.participant === null || team.data.participant.type === "solo");
 
   return (
-    <main aria-busy={team.isPending}>
-      <h1>Team</h1>
-      {team.isPending ? <p role="status">Loading team…</p> : null}
-      {team.isError ? <p role="alert">Could not load your team. Check your connection and retry.</p> : null}
+    <Layout
+      contentWidth={640}
+      content={
+        <LayoutContent>
+          <VStack gap={4}>
+            <Heading level={1}>Team</Heading>
+            {team.isPending ? <Skeleton aria-label="Loading team…" /> : null}
+            {team.isError ? (
+              <Banner
+                status="error"
+                title="Could not load your team"
+                description="Check your connection and retry."
+                collapsible={false}
+              />
+            ) : null}
 
-      {(team.data?.participant === null || team.data?.participant?.type === "solo") &&
-      team.data !== undefined ? (
-        <section aria-label="Create a team">
-          <h2>Create a team</h2>
-          {team.data.participant?.type === "solo" ? (
-            <p className="muted">You are playing solo. Leave your solo entry below first, then create a team.</p>
-          ) : null}
-          <form onSubmit={(event) => void handleCreate(event)}>
-            <label htmlFor="team-name">Team name (3–40 characters)</label>
-            <input
-              id="team-name"
-              name="teamName"
-              type="text"
-              autoComplete="off"
-              maxLength={40}
-              minLength={3}
-              value={teamName}
-              onChange={(event) => setTeamName(event.target.value)}
-            />
-            <button type="submit" disabled={state === "pending"} aria-busy={state === "pending"}>
-              {state === "pending" ? "Creating…" : "Create team"}
-            </button>
-          </form>
-          <div aria-live="polite">
-            {state === "success" ? <p role="status">{message}</p> : null}
-            {state === "failure" ? <p role="alert">{message}</p> : null}
-          </div>
-        </section>
-      ) : null}
+            {showCreateForm ? (
+              <Section aria-label="Create a team">
+                <Card>
+                  <form onSubmit={(event) => void handleCreate(event)}>
+                    <FormLayout>
+                      <Heading level={2}>Create a team</Heading>
+                      {team.data?.participant?.type === "solo" ? (
+                        <Text color="secondary">
+                          You are playing solo. Leave your solo entry below first, then create a team.
+                        </Text>
+                      ) : null}
+                      <TextInput
+                        label="Team name (3–40 characters)"
+                        value={teamName}
+                        onChange={setTeamName}
+                        autoComplete="off"
+                        isRequired
+                      />
+                      <Button
+                        label={state === "pending" ? "Creating…" : "Create team"}
+                        variant="primary"
+                        type="submit"
+                        isLoading={state === "pending"}
+                        width="100%"
+                      />
+                    </FormLayout>
+                  </form>
+                </Card>
+              </Section>
+            ) : null}
 
-      {team.data?.participant ? (
-        <>
-          <section aria-label="Members">
-            <h2>
-              {team.data.participant.name} ({team.data.participant.type})
-            </h2>
-            <p className="muted">
-              {team.data.participant.eventPoints} event points
-              {team.data.participant.penaltySeconds > 0
-                ? ` · ${team.data.participant.penaltySeconds}s penalties`
-                : null}
-            </p>
-            <ul className="stack">
-              {team.data.members.map((member) => (
-                <li key={member.userId} className="card card-row">
-                  <span>{member.username}</span>
-                  <span className="muted">{member.role}</span>
-                </li>
-              ))}
-            </ul>
-            {team.data.members.length === 0 ? <p>You are playing solo. Create a team to invite others.</p> : null}
-          </section>
+            {team.data?.participant ? (
+              <Section aria-label="Members">
+                <VStack gap={2}>
+                  <Heading level={2}>
+                    {team.data.participant.name} ({team.data.participant.type})
+                  </Heading>
+                  <Text color="secondary">
+                    {team.data.participant.eventPoints} event points
+                    {team.data.participant.penaltySeconds > 0
+                      ? ` · ${team.data.participant.penaltySeconds}s penalties`
+                      : null}
+                  </Text>
+                  {team.data.members.length > 0 ? (
+                    <AvatarGroup size="sm">
+                      {team.data.members.map((member) => (
+                        <Avatar key={member.userId} name={member.username} />
+                      ))}
+                    </AvatarGroup>
+                  ) : null}
+                  {team.data.members.length === 0 ? (
+                    <EmptyState
+                      title="Playing solo"
+                      description="You are playing solo. Create a team to invite others."
+                      isCompact
+                    />
+                  ) : (
+                    <List header={<Text type="label">Members</Text>} hasDividers>
+                      {team.data.members.map((member) => (
+                        <ListItem
+                          key={member.userId}
+                          label={member.username}
+                          description={member.role}
+                          startContent={<Avatar name={member.username} />}
+                        />
+                      ))}
+                    </List>
+                  )}
+                </VStack>
+              </Section>
+            ) : null}
 
-          {team.data.canManage ? (
-            <>
-              <section aria-label="Join requests">
-                <h2>Join requests</h2>
-                {team.data.pendingRequests.length === 0 ? <p>No pending requests.</p> : null}
-                <ul className="stack">
-                  {team.data.pendingRequests.map((request) => (
-                    <li key={request.id} className="card card-row">
-                      <span>{request.username}</span>
-                      <span className="actions">
-                        <button
-                          type="button"
-                          disabled={state === "pending"}
-                          onClick={() =>
-                            void run(`${request.username} approved.`, () =>
-                              submitWithIdempotency(`/join-requests/${request.id}/approve`, {}, isOk)
-                            )
+            {team.data?.participant && team.data.canManage ? (
+              <Section aria-label="Join requests">
+                <VStack gap={2}>
+                  <Heading level={2}>Join requests</Heading>
+                  {team.data.pendingRequests.length === 0 ? (
+                    <EmptyState title="No pending requests" description="New requests will appear here." isCompact />
+                  ) : (
+                    <List hasDividers>
+                      {team.data.pendingRequests.map((request) => (
+                        <ListItem
+                          key={request.id}
+                          label={request.username}
+                          description="Wants to join this team"
+                          endContent={
+                            <>
+                              <Button
+                                label="Approve"
+                                variant="primary"
+                                size="sm"
+                                isDisabled={state === "pending"}
+                                onClick={() =>
+                                  void run(`${request.username} approved.`, () =>
+                                    submitWithIdempotency(`/join-requests/${request.id}/approve`, {}, isOk)
+                                  )
+                                }
+                              />
+                              <Button
+                                label="Reject"
+                                variant="secondary"
+                                size="sm"
+                                isDisabled={state === "pending"}
+                                onClick={() =>
+                                  void run(`${request.username} rejected.`, () =>
+                                    apiPost(`/join-requests/${request.id}/reject`, {}, isOk)
+                                  )
+                                }
+                              />
+                            </>
                           }
-                        >
-                          Approve
-                        </button>
-                        <button
-                          type="button"
-                          disabled={state === "pending"}
-                          onClick={() =>
-                            void run(`${request.username} rejected.`, () =>
-                              apiPost(`/join-requests/${request.id}/reject`, {}, isOk)
-                            )
-                          }
-                        >
-                          Reject
-                        </button>
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-                <p className="muted">Approving a request after the first completion adds a late-join penalty.</p>
-              </section>
+                        />
+                      ))}
+                    </List>
+                  )}
+                  <Text color="secondary">
+                    Approving a request after the first completion adds a late-join penalty.
+                  </Text>
+                </VStack>
+              </Section>
+            ) : null}
 
-              <section aria-label="Invite link">
-                <h2>Invite link</h2>
-                <p className="muted">
-                  Create a link, share it, then approve requests above. The token is shown once.
-                </p>
-                <button
-                  type="button"
-                  disabled={state === "pending"}
-                  onClick={() =>
-                    void (async () => {
-                      if (state === "pending" || !participantId) return;
-                      setState("pending");
-                      setMessage("");
-                      try {
-                        const result = await submitWithIdempotency(
-                          `/participants/${participantId}/invites`,
-                          {},
-                          isInvite
-                        );
-                        setInviteToken(result.token);
-                        setState("success");
-                        setMessage("Invite created. Share the token below.");
-                      } catch (error) {
-                        setState("failure");
-                        setMessage(
-                          error instanceof ApiError ? error.message : "Could not create the invite."
-                        );
+            {team.data?.participant && team.data.canManage ? (
+              <Section aria-label="Invite link">
+                <Card>
+                  <VStack gap={2}>
+                    <Heading level={2}>Invite link</Heading>
+                    <Text color="secondary">
+                      Create a link, share it, then approve requests above. The token is shown once.
+                    </Text>
+                    <Button
+                      label="Create invite link"
+                      variant="secondary"
+                      isDisabled={state === "pending" || !participantId}
+                      onClick={() =>
+                        void (async () => {
+                          if (state === "pending" || !participantId) return;
+                          setState("pending");
+                          setMessage("");
+                          try {
+                            const result = await submitWithIdempotency(
+                              `/participants/${participantId}/invites`,
+                              {},
+                              isInvite
+                            );
+                            setInviteToken(result.token);
+                            setState("success");
+                            setMessage("Invite created. Share the token below.");
+                          } catch (error) {
+                            setState("failure");
+                            setMessage(
+                              error instanceof ApiError ? error.message : "Could not create the invite."
+                            );
+                          }
+                        })()
                       }
-                    })()
-                  }
-                >
-                  Create invite link
-                </button>
-                {inviteToken ? (
-                  <p>
-                    <code>{inviteToken}</code>
-                  </p>
-                ) : null}
-              </section>
-            </>
-          ) : null}
+                      width="100%"
+                    />
+                    {inviteToken ? <Text type="code">{inviteToken}</Text> : null}
+                  </VStack>
+                </Card>
+              </Section>
+            ) : null}
 
-          <section aria-label="Leave">
-            <h2>Leave</h2>
-            <p className="muted">Leaving returns you to zero individual progress. The team keeps its progress.</p>
-            <button
-              type="button"
-              disabled={state === "pending"}
-              onClick={() =>
-                void run("You left the team.", () =>
-                  participantId ? apiPost(`/participants/${participantId}/leave`, {}, isOk) : Promise.reject(new Error("missing"))
-                )
-              }
-            >
-              Leave team
-            </button>
-          </section>
-        </>
-      ) : null}
-      <div aria-live="polite">
-        {state === "success" ? <p role="status">{message}</p> : null}
-        {state === "failure" ? <p role="alert">{message}</p> : null}
-      </div>
-    </main>
+            {team.data?.participant ? (
+              <Section aria-label="Leave">
+                <Card>
+                  <VStack gap={2}>
+                    <Heading level={2}>Leave</Heading>
+                    <Text color="secondary">
+                      Leaving returns you to zero individual progress. The team keeps its progress.
+                    </Text>
+                    <Button
+                      label="Leave team"
+                      variant="destructive"
+                      isDisabled={state === "pending"}
+                      onClick={() =>
+                        void run("You left the team.", () =>
+                          participantId
+                            ? apiPost(`/participants/${participantId}/leave`, {}, isOk)
+                            : Promise.reject(new Error("missing"))
+                        )
+                      }
+                      width="100%"
+                    />
+                  </VStack>
+                </Card>
+              </Section>
+            ) : null}
+
+            {state === "success" ? (
+              <Banner status="success" title="Done" description={message} collapsible={false} />
+            ) : null}
+            {state === "failure" ? (
+              <Banner status="error" title="Something went wrong" description={message} collapsible={false} />
+            ) : null}
+          </VStack>
+        </LayoutContent>
+      }
+    />
   );
 }

@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { Text } from "@astryxdesign/core/Text";
+import { VStack } from "@astryxdesign/core/VStack";
 
 interface CountdownProps {
   targetIso: string;
@@ -27,21 +29,21 @@ export default function Countdown({ targetIso, label }: CountdownProps) {
   }, []);
 
   if (Number.isNaN(targetTime)) {
-    return (
-      <p role="status" className="muted">
-        {label ?? "Event time"}: to be announced.
-      </p>
-    );
+    return <Text color="secondary">{label ?? "Event time"}: to be announced.</Text>;
   }
 
   const remainingSeconds = Math.max(0, Math.floor((targetTime - now) / 1000));
   const finished = remainingSeconds <= 0;
 
   return (
-    <div className="countdown" role="timer" aria-live="off" aria-label={label ?? "Event countdown"}>
-      <span className="countdown-label">{label ?? "Starts in"}</span>
-      <span className="countdown-value">{finished ? "Live now" : formatRemaining(remainingSeconds)}</span>
-      <span className="muted">Official time is set by the server.</span>
-    </div>
+    <VStack gap={1} role="timer" aria-live="off" aria-label={label ?? "Event countdown"}>
+      <Text type="label" color="secondary">
+        {label ?? "Starts in"}
+      </Text>
+      <Text size="xl" weight="semibold" hasTabularNumbers>
+        {finished ? "Live now" : formatRemaining(remainingSeconds)}
+      </Text>
+      <Text type="supporting">Official time is set by the server.</Text>
+    </VStack>
   );
 }
