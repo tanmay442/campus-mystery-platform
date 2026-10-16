@@ -1,3 +1,4 @@
+#Abandoned --- not doin ts
 # Campus Mystery Event Platform
 
 Mobile-first, reusable gamified event platform. First use case: campus mystery
